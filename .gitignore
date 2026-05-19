@@ -1,0 +1,28 @@
+# Python virtual environments and caches
+.venv/
+**/.venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+
+# Local secrets and saved API keys
+.env
+.env.*
+.translator_config.json
+新方案/.new_scheme_config.json
+复合方法/.hybrid_config.json
+
+# Generated translation outputs
+输出/
+**/输出/
+
+# Temporary and local editor files
+*.tmp
+*.temp
+*.bak
+*.backup
+*.log
+~$*
+.DS_Store
+Thumbs.db
