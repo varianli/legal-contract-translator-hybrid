@@ -6,6 +6,7 @@ import time
 import traceback
 from copy import copy
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from tkinter import BOTH, END, LEFT, RIGHT, X, BooleanVar, Button, Checkbutton, Entry, Frame, Label, OptionMenu, StringVar, Text, Tk, filedialog, messagebox
 from tkinter.ttk import Progressbar
@@ -47,6 +48,7 @@ CAPITAL_MARKETS_LEGAL_RAG = """Capital markets legal English retrieval notes:
 - Translate \u62ab\u9732\u51fd / \u62ab\u9732\u6e05\u5355 as Disclosure Schedule. If it is titled \u9644\u5f55\u4e94\uff08\u62ab\u9732\u51fd\uff09, use Appendix V (Disclosure Schedule).
 - Translate \u4ea4\u5272 as Closing, \u4ea4\u5272\u65e5 as Closing Date, \u6700\u8fdf\u5b8c\u6210\u65e5 as Longstop Date, \u7b7e\u7f72\u65e5 as Signing Date.
 - Translate \u672c\u6b21\u4ea4\u6613 as this Transaction, \u6295\u8d44\u6b3e as Investment Amount, \u76ee\u6807\u516c\u53f8 as Target Company, \u96c6\u56e2\u516c\u53f8 as Group Company / Group Companies.
+- For RMB amounts expressed as \u4eba\u6c11\u5e01X\u4e07\u5143, convert to yuan in English: \u4eba\u6c11\u5e0112.7764\u4e07\u5143 -> RMB 127,764. Do not output Ten Thousand Yuan or million for \u4e07\u5143.
 - Preserve defined-term capitalization once established. If the same Chinese term recurs, reuse the same English term.
 - Use English punctuation in English output: straight quotes, half-width commas, periods, semicolons, colons, parentheses, and brackets."""
 
@@ -157,9 +159,43 @@ def normalize_english_punctuation(text: str) -> str:
     text = (text or "").translate(CJK_PUNCT_TRANSLATION)
     text = re.sub(r"\s+([,.;:!?\]\)])", r"\1", text)
     text = re.sub(r"([\[\(])\s+", r"\1", text)
-    text = re.sub(r"([,.;:!?])(?=[A-Za-z0-9\"'])", r"\1 ", text)
+    text = re.sub(r"([,;:!?])(?=[A-Za-z\"'])", r"\1 ", text)
+    text = re.sub(r"(?<!\d)(\.)(?=[A-Za-z\"'])", r"\1 ", text)
+    text = re.sub(r"(?<=\d),\s+(?=\d{3}\b)", ",", text)
+    text = re.sub(r"(?<=\d)\.\s+(?=\d)", ".", text)
     text = re.sub(r"\s{2,}", " ", text)
     return text.strip()
+
+
+FULL_RMB_WANYUAN_RE = re.compile(r"^\s*\u4eba\u6c11\u5e01\s*([\u3010\[])?\s*([0-9][0-9,，]*(?:\.\d+)?)\s*([\u3011\]])?\s*\u4e07\u5143\s*$")
+
+
+def format_rmb_yuan_from_wanyuan(number_text: str) -> str | None:
+    cleaned = (number_text or "").replace(",", "").replace("，", "").strip()
+    try:
+        amount = (Decimal(cleaned) * Decimal("10000")).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    except (InvalidOperation, ValueError):
+        return None
+    return f"{int(amount):,}"
+
+
+def deterministic_amount_translation(source_text: str) -> str | None:
+    match = FULL_RMB_WANYUAN_RE.fullmatch(source_text or "")
+    if not match:
+        return None
+    amount = format_rmb_yuan_from_wanyuan(match.group(2))
+    if not amount:
+        return None
+    if match.group(1) or match.group(3):
+        return f"RMB [{amount}]"
+    return f"RMB {amount}"
+
+
+def normalize_translation_against_source(source_text: str, translation: str) -> str:
+    deterministic = deterministic_amount_translation(source_text)
+    if deterministic:
+        return deterministic
+    return normalize_legal_english(translation)
 
 
 def normalize_roman_token(token: str) -> str:
@@ -351,6 +387,17 @@ def parse_translated_markdown(markdown: str) -> dict[int, str]:
         body = re.sub(r"^#{1,6}\s+", "", body).strip()
         results[block_id] = normalize_legal_english(body)
     return results
+
+
+def build_translated_blocks_markdown(blocks: list[dict], translated_blocks: dict[int, str]) -> str:
+    parts = []
+    for block in blocks:
+        block_id = int(block["id"])
+        if block_id not in translated_blocks:
+            continue
+        meta_json = json.dumps(block.get("meta", {}), ensure_ascii=False)
+        parts.append(f"<!-- BLOCK:{block_id} -->\n{translated_blocks[block_id]}\n<!-- META:{meta_json} -->")
+    return "\n\n".join(parts)
 
 
 def xml_has_off_property(element, tag_name: str) -> bool:
@@ -829,6 +876,10 @@ def translate_docx_hybrid(
         translated_markdown = translate_markdown_chunk(client, provider, model, memory, chunk_markdown, before, after)
         translated_markdown_parts.append(translated_markdown)
         chunk_translations = parse_translated_markdown(translated_markdown)
+        for block in chunk:
+            block_id = int(block["id"])
+            if block_id in chunk_translations:
+                chunk_translations[block_id] = normalize_translation_against_source(block["text"], chunk_translations[block_id])
         translated_blocks.update(chunk_translations)
         all_mappings.extend(map_format_spans(client, provider, model, memory, chunk, chunk_translations))
         completed += len(chunk)
@@ -855,7 +906,7 @@ def translate_docx_hybrid(
         )
     for block in blocks:
         block_id = block["id"]
-        translation = normalize_legal_english(translated_blocks.get(block_id, "").strip())
+        translation = normalize_translation_against_source(block["text"], translated_blocks.get(block_id, "").strip())
         intervals = []
         occupied = []
         if not translation:
@@ -940,7 +991,7 @@ def translate_docx_hybrid(
         json_path = json_path.with_name(f"{json_path.stem}{suffix}{json_path.suffix}")
 
     source_md_path.write_text(source_markdown, encoding="utf-8")
-    translated_md_path.write_text("\n\n".join(translated_markdown_parts), encoding="utf-8")
+    translated_md_path.write_text(build_translated_blocks_markdown(blocks, translated_blocks), encoding="utf-8")
     checklist_path.write_text(checklist_markdown(checklist), encoding="utf-8")
     json_path.write_text(
         json.dumps({"cancelled": cancelled, "blocks": blocks, "mappings": all_mappings, "checklist": checklist}, ensure_ascii=False, indent=2),
