@@ -34,7 +34,7 @@ PROVIDER_DEFAULTS = {
     "OpenAI": {"base_url": "", "model": "gpt-4.1", "key_label": "OpenAI API Key"},
     "DeepSeek": {"base_url": "https://api.deepseek.com", "model": "deepseek-v4-flash", "key_label": "DeepSeek API Key"},
 }
-APP_VERSION = "v1.5"
+APP_VERSION = "v1.6"
 ENGLISH_FONT_OPTIONS = ("Times New Roman", "Calibri")
 CHINESE_FONT_OPTIONS = ("楷体_GB2312", "宋体")
 DEFAULT_ENGLISH_FONT = "Times New Roman"
@@ -190,6 +190,17 @@ def normalize_english_punctuation(text: str) -> str:
     return text.strip()
 
 
+def strip_markdown_emphasis(text: str) -> str:
+    text = text or ""
+    previous = None
+    while previous != text:
+        previous = text
+        text = re.sub(r"\*\*([^*\n]+?)\*\*", r"\1", text)
+        text = re.sub(r"(?<!\*)\*([^*\n]+?)\*(?!\*)", r"\1", text)
+        text = re.sub(r"`([^`\n]+?)`", r"\1", text)
+    return text
+
+
 FULL_RMB_WANYUAN_RE = re.compile(r"^\s*\u4eba\u6c11\u5e01\s*([\u3010\[])?\s*([0-9][0-9,，]*(?:\.\d+)?)\s*([\u3011\]])?\s*\u4e07\u5143\s*$")
 FULL_CHINESE_DATE_RE = re.compile(r"^\s*(\d{4})\s*\u5e74\s*(\d{1,2}|\u3010\u3011|_+)\s*\u6708\s*(\d{1,2}|\u3010\u3011|_+)\s*\u65e5\s*$")
 SOURCE_BRACKET_RE = re.compile(r"\u3010([^\u3011]*)\u3011")
@@ -288,6 +299,7 @@ def normalize_roman_token(token: str) -> str:
 
 
 def normalize_legal_english(text: str) -> str:
+    text = strip_markdown_emphasis(text)
     text = normalize_english_punctuation(text)
 
     def appendix_repl(match):
@@ -1012,8 +1024,41 @@ def paragraph_rpr(paragraph):
     return None if ppr is None else ppr.find(qn("w:rPr"))
 
 
-def base_format_overrides(paragraph) -> dict[str, bool]:
-    overrides = {"bold": False, "italic": False, "underline": False, "highlight": False}
+def style_font_size(style):
+    while style is not None:
+        font = getattr(style, "font", None)
+        size = getattr(font, "size", None) if font is not None else None
+        if size:
+            return size
+        style = getattr(style, "base_style", None)
+    return None
+
+
+def run_font_size(run):
+    size = getattr(run.font, "size", None)
+    if size:
+        return size
+    return style_font_size(getattr(run, "style", None))
+
+
+def paragraph_font_size(paragraph):
+    for run in paragraph.runs:
+        if not run.text:
+            continue
+        size = run_font_size(run)
+        if size:
+            return size
+    return style_font_size(getattr(paragraph, "style", None))
+
+
+def base_format_overrides(paragraph) -> dict[str, object]:
+    overrides = {
+        "bold": False,
+        "italic": False,
+        "underline": False,
+        "highlight": False,
+        "font_size": paragraph_font_size(paragraph),
+    }
     rpr = paragraph_rpr(paragraph)
     if xml_has_off_property(rpr, "b"):
         overrides["bold"] = True
@@ -1047,7 +1092,7 @@ def set_highlight_none(run) -> None:
     rpr.append(highlight)
 
 
-def apply_base_format(run, base_format: dict[str, bool]) -> None:
+def apply_base_format(run, base_format: dict[str, object]) -> None:
     if base_format.get("bold"):
         run.bold = False
     if base_format.get("italic"):
@@ -1056,6 +1101,9 @@ def apply_base_format(run, base_format: dict[str, bool]) -> None:
         run.underline = False
     if base_format.get("highlight"):
         set_highlight_none(run)
+    font_size = base_format.get("font_size")
+    if font_size:
+        run.font.size = font_size
 
 
 FONT_TOKEN_RE = re.compile(r"\d[\d,.\-/%:]*|[\u3400-\u9fff]+|[^\d\u3400-\u9fff]+")
@@ -1079,14 +1127,14 @@ def set_run_fonts(run, token: str, english_font: str, chinese_font: str) -> None
     rfonts.set(qn("w:eastAsia"), chinese_font)
 
 
-def add_run_with_base_format(paragraph, text: str, base_format: dict[str, bool], english_font: str, chinese_font: str):
+def add_run_with_base_format(paragraph, text: str, base_format: dict[str, object], english_font: str, chinese_font: str):
     run = paragraph.add_run(text)
     apply_base_format(run, base_format)
     set_run_fonts(run, text, english_font, chinese_font)
     return run
 
 
-def apply_style(run, span: FormatSpan, base_format: dict[str, bool], english_font: str, chinese_font: str) -> None:
+def apply_style(run, span: FormatSpan, base_format: dict[str, object], english_font: str, chinese_font: str) -> None:
     apply_base_format(run, base_format)
     set_run_fonts(run, run.text, english_font, chinese_font)
     if span.bold:
@@ -1099,7 +1147,7 @@ def apply_style(run, span: FormatSpan, base_format: dict[str, bool], english_fon
         run.font.highlight_color = span.highlight_color
 
 
-def add_text_runs(paragraph, text: str, base_format: dict[str, bool], english_font: str, chinese_font: str, span: FormatSpan | None = None) -> None:
+def add_text_runs(paragraph, text: str, base_format: dict[str, object], english_font: str, chinese_font: str, span: FormatSpan | None = None) -> None:
     for token in split_font_tokens(text):
         run = add_run_with_base_format(paragraph, token, base_format, english_font, chinese_font)
         if span is not None:
