@@ -34,12 +34,13 @@ PROVIDER_DEFAULTS = {
     "OpenAI": {"base_url": "", "model": "gpt-4.1", "key_label": "OpenAI API Key"},
     "DeepSeek": {"base_url": "https://api.deepseek.com", "model": "deepseek-v4-flash", "key_label": "DeepSeek API Key"},
 }
-APP_VERSION = "v1.8"
+APP_VERSION = "v1.9"
 ENGLISH_FONT_OPTIONS = ("Times New Roman", "Calibri")
 CHINESE_FONT_OPTIONS = ("楷体_GB2312", "宋体")
 DEFAULT_ENGLISH_FONT = "Times New Roman"
 DEFAULT_CHINESE_FONT = "宋体"
 DIGIT_FONT = "Times New Roman"
+PROGRESS_TOTAL = 100
 
 SYSTEM_PROMPT = """You are a senior bilingual legal translator and document-format alignment specialist.
 Translate Chinese legal contracts into precise formal legal English.
@@ -176,6 +177,36 @@ def compact_text(text: str, limit: int) -> str:
         return text
     half = max(1, limit // 2)
     return text[:half] + "\n...[middle omitted]...\n" + text[-half:]
+
+
+def progress_ratio(done: int | float, total: int | float) -> float:
+    try:
+        total_value = float(total)
+        if total_value <= 0:
+            return 0.0
+        return max(0.0, min(1.0, float(done) / total_value))
+    except (TypeError, ValueError, ZeroDivisionError):
+        return 0.0
+
+
+def report_progress(progress, value: int | float, current: str) -> None:
+    progress(max(0, min(99, int(round(value)))), PROGRESS_TOTAL, current)
+
+
+def report_complete(progress, current: str) -> None:
+    progress(PROGRESS_TOTAL, PROGRESS_TOTAL, current)
+
+
+def make_phase_progress(progress, start: int | float, end: int | float):
+    def phase(done: int | float, total: int | float, current: str) -> None:
+        ratio = progress_ratio(done, total)
+        report_progress(progress, start + (end - start) * ratio, current)
+
+    return phase
+
+
+def report_phase(progress, start: int | float, end: int | float, done: int | float, total: int | float, current: str) -> None:
+    make_phase_progress(progress, start, end)(done, total, current)
 
 
 def legal_rag_for_text(text: str) -> str:
@@ -1611,8 +1642,10 @@ def translate_docx_hybrid(
 
     source_markdown = "\n\n".join(block["markdown"] for block in blocks)
     client = build_client(api_key, base_url)
+    report_progress(progress, 2, "正在抽取公司/机构名表...")
     company_entries = make_company_name_glossary(client, provider, model, source_markdown, log)
     company_glossary = company_glossary_to_prompt(company_entries)
+    report_progress(progress, 4, "正在生成术语记忆和翻译规则...")
     memory = make_translation_memory(client, provider, model, source_markdown, log, font_instruction, company_glossary)
     chunks = build_chunks(blocks)
     log(f"{APP_VERSION} 复合方法：{len(blocks)} 个中文 block，分为 {len(chunks)} 个 Markdown 大段批次。")
@@ -1634,7 +1667,7 @@ def translate_docx_hybrid(
         before = "\n\n".join(block["markdown"] for block in blocks[max(0, blocks.index(chunk[0]) - 3) : blocks.index(chunk[0])])
         after_start = blocks.index(chunk[-1]) + 1
         after = "\n\n".join(block["markdown"] for block in blocks[after_start : min(len(blocks), after_start + 3)])
-        progress(completed, len(blocks), f"翻译 Markdown 大段 {chunk_index}/{len(chunks)}")
+        report_phase(progress, 5, 58, completed, len(blocks), f"翻译 Markdown 大段 {chunk_index}/{len(chunks)}")
         translated_markdown = translate_markdown_chunk(client, provider, model, memory, chunk_markdown, before, after, font_instruction, company_glossary)
         translated_markdown_parts.append(translated_markdown)
         chunk_translations = parse_translated_markdown(translated_markdown)
@@ -1647,13 +1680,24 @@ def translate_docx_hybrid(
         if cancel_event and cancel_event.is_set():
             cancelled = True
             log("当前 Markdown 批次已完成；根据中止请求，开始导出当前进度。")
-            progress(completed, len(blocks), "已中止，正在导出当前进度")
+            report_progress(progress, 98, "已中止，正在导出当前进度")
             break
-        progress(completed, len(blocks), f"大段 {chunk_index}/{len(chunks)} 已完成")
+        report_phase(progress, 5, 58, completed, len(blocks), f"大段 {chunk_index}/{len(chunks)} 已完成")
 
     if not cancelled:
         auto_repaired_blocks.update(
-            repair_all_translations(client, provider, model, memory, blocks, translated_blocks, log, progress, font_instruction, company_glossary)
+            repair_all_translations(
+                client,
+                provider,
+                model,
+                memory,
+                blocks,
+                translated_blocks,
+                log,
+                make_phase_progress(progress, 58, 72),
+                font_instruction,
+                company_glossary,
+            )
         )
         final_audit_repaired_blocks.update(
             final_llm_audit_and_repair_translations(
@@ -1664,7 +1708,7 @@ def translate_docx_hybrid(
                 blocks,
                 translated_blocks,
                 log,
-                progress,
+                make_phase_progress(progress, 72, 86),
                 font_instruction,
                 company_entries,
                 company_glossary,
@@ -1675,9 +1719,10 @@ def translate_docx_hybrid(
         ready_chunk = [block for block in chunk if translated_blocks.get(int(block["id"]), "").strip()]
         if not ready_chunk:
             continue
-        progress(len(blocks), len(blocks), f"映射格式 {chunk_index}/{len(chunks)}")
+        report_phase(progress, 86, 96, chunk_index - 1, len(chunks), f"映射格式 {chunk_index}/{len(chunks)}")
         chunk_translations = {int(block["id"]): translated_blocks.get(int(block["id"]), "") for block in ready_chunk}
         all_mappings.extend(map_format_spans(client, provider, model, memory, ready_chunk, chunk_translations, font_instruction))
+        report_phase(progress, 86, 96, chunk_index, len(chunks), f"格式映射 {chunk_index}/{len(chunks)} 已完成")
 
     mappings_by_span = {str(mapping.get("span_id")): mapping for mapping in all_mappings if mapping.get("span_id")}
     checklist = []
@@ -1693,7 +1738,9 @@ def translate_docx_hybrid(
                 "note": "用户中止；已导出当前已完成批次，未完成 block 保留原文。",
             }
         )
-    for block in blocks:
+    for index, block in enumerate(blocks, start=1):
+        if index == 1 or index == len(blocks) or index % 25 == 0:
+            report_phase(progress, 96, 98, index - 1, len(blocks), f"正在写入译文和格式 {index}/{len(blocks)}")
         block_id = block["id"]
         translation = normalize_translation_against_source(block["text"], translated_blocks.get(block_id, "").strip())
         intervals = []
@@ -1787,6 +1834,7 @@ def translate_docx_hybrid(
         if needs_translation_repair(block["text"], translation):
             checklist.append({"status": "HAS_CHINESE_IN_TRANSLATION", "block_id": block_id, "note": "译文仍疑似存在漏翻或大段中文残留。"})
         rewrite_paragraph(paragraphs[block_id], translation, intervals, english_font, chinese_font)
+    report_progress(progress, 98, "正在导出 Word 和明细文件...")
 
     base = input_path.stem
     suffix = "_已中止" if cancelled else ""
@@ -1820,7 +1868,7 @@ def translate_docx_hybrid(
         ),
         encoding="utf-8",
     )
-    progress(completed if cancelled else len(blocks), len(blocks), "已中止并导出当前进度" if cancelled else "全部完成")
+    report_complete(progress, "已中止并导出当前进度" if cancelled else "全部完成")
     return docx_path, source_md_path, translated_md_path, checklist_path, json_path, cancelled
 
 
