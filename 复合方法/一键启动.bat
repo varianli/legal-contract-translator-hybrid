@@ -4,16 +4,11 @@ setlocal
 cd /d "%~dp0"
 
 set "PARENT_VENV=%~dp0..\.venv\Scripts\python.exe"
-set "BUNDLED_PY=C:\Users\varianli\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
 set "PYTHON_EXE="
 set "PYTHON_ARGS="
 
 if exist "%PARENT_VENV%" (
   set "PYTHON_EXE=%PARENT_VENV%"
-  goto have_python
-)
-if exist "%BUNDLED_PY%" (
-  set "PYTHON_EXE=%BUNDLED_PY%"
   goto have_python
 )
 py -3 --version >nul 2>nul
@@ -27,7 +22,45 @@ if not errorlevel 1 (
   set "PYTHON_EXE=python"
   goto have_python
 )
-echo Python was not found.
+
+echo.
+echo Python was not found on this computer.
+echo Trying to install Python 3.12 automatically with winget...
+winget --version >nul 2>nul
+if errorlevel 1 goto python_manual_install
+
+winget install -e --id Python.Python.3.12 --accept-package-agreements --accept-source-agreements
+if errorlevel 1 goto python_manual_install
+
+py -3 --version >nul 2>nul
+if not errorlevel 1 (
+  set "PYTHON_EXE=py"
+  set "PYTHON_ARGS=-3"
+  goto have_python
+)
+python --version >nul 2>nul
+if not errorlevel 1 (
+  set "PYTHON_EXE=python"
+  goto have_python
+)
+
+echo.
+echo Python seems installed, but this window cannot find it yet.
+echo Please close this window and double-click this bat file again.
+pause
+exit /b 1
+
+:python_manual_install
+echo.
+echo Automatic Python installation was not available.
+echo Please install Python 3.12 or newer, then run this bat again.
+echo.
+echo Recommended steps:
+echo 1. Open https://www.python.org/downloads/
+echo 2. Download Python for Windows.
+echo 3. During installation, tick "Add python.exe to PATH".
+echo 4. Finish installation, then double-click this bat again.
+echo.
 pause
 exit /b 1
 
