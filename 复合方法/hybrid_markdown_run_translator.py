@@ -34,13 +34,14 @@ PROVIDER_DEFAULTS = {
     "OpenAI": {"base_url": "", "model": "gpt-4.1", "key_label": "OpenAI API Key"},
     "DeepSeek": {"base_url": "https://api.deepseek.com", "model": "deepseek-v4-flash", "key_label": "DeepSeek API Key"},
 }
-APP_VERSION = "v1.9"
+APP_VERSION = "v1.10"
 ENGLISH_FONT_OPTIONS = ("Times New Roman", "Calibri")
 CHINESE_FONT_OPTIONS = ("楷体_GB2312", "宋体")
 DEFAULT_ENGLISH_FONT = "Times New Roman"
 DEFAULT_CHINESE_FONT = "宋体"
 DIGIT_FONT = "Times New Roman"
 PROGRESS_TOTAL = 100
+ENABLE_COMPANY_NAME_GLOSSARY = False
 
 SYSTEM_PROMPT = """You are a senior bilingual legal translator and document-format alignment specialist.
 Translate Chinese legal contracts into precise formal legal English.
@@ -49,8 +50,9 @@ Return only valid JSON when JSON is requested."""
 
 FINAL_AUDIT_SYSTEM_PROMPT = """You are a senior legal translation QA reviewer.
 Your task is to quickly audit completed English translations of Chinese capital-markets legal documents and identify only blocks that still contain untranslated Chinese/CJK legal content.
-Flag a block when Chinese/CJK characters remain as substantive legal prose, clause headings, table labels, sentence fragments, mixed Chinese-English leftovers, or Chinese-only company/person names that should be rendered as English Name (Chinese Name).
-Do not flag Chinese/CJK characters that are intentionally retained as part of an already translated proper-name format such as English Name (Chinese Name), original placeholders inside 【】, trademark/brand marks with English context, or source-required bracket blanks.
+Flag a block when Chinese/CJK characters remain as substantive legal prose, clause headings, table labels, sentence fragments, or mixed Chinese-English leftovers.
+Do not enforce English Name (Chinese Name) formatting for company, fund, shareholder, investor, or person names.
+Do not flag Chinese/CJK characters that are intentionally retained as part of company names, fund names, investor short names, trademark/brand marks, original placeholders inside 【】, or source-required bracket blanks.
 Return only valid JSON."""
 
 CAPITAL_MARKETS_LEGAL_RAG = """Capital markets legal English retrieval notes:
@@ -207,6 +209,51 @@ def make_phase_progress(progress, start: int | float, end: int | float):
 
 def report_phase(progress, start: int | float, end: int | float, done: int | float, total: int | float, current: str) -> None:
     make_phase_progress(progress, start, end)(done, total, current)
+
+
+class TranslationCancelled(Exception):
+    pass
+
+
+_CANCEL_CONTEXT = threading.local()
+
+
+def set_active_cancel_event(cancel_event: threading.Event | None) -> None:
+    _CANCEL_CONTEXT.event = cancel_event
+
+
+def get_active_cancel_event() -> threading.Event | None:
+    return getattr(_CANCEL_CONTEXT, "event", None)
+
+
+def raise_if_cancelled() -> None:
+    cancel_event = get_active_cancel_event()
+    if cancel_event and cancel_event.is_set():
+        raise TranslationCancelled()
+
+
+def run_cancellable_api_call(callable_obj):
+    cancel_event = get_active_cancel_event()
+    if not cancel_event:
+        return callable_obj()
+
+    result = {}
+
+    def worker():
+        try:
+            result["value"] = callable_obj()
+        except BaseException as exc:
+            result["error"] = exc
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    while thread.is_alive():
+        if cancel_event.is_set():
+            raise TranslationCancelled()
+        thread.join(0.2)
+    if "error" in result:
+        raise result["error"]
+    return result.get("value")
 
 
 def legal_rag_for_text(text: str) -> str:
@@ -519,18 +566,26 @@ def parse_json_object(raw: str) -> dict:
 def chat_json(client: OpenAI, provider: str, model: str, messages: list[dict], retries: int = 3) -> dict:
     last_error = None
     for attempt in range(retries):
+        raise_if_cancelled()
         response_format_options = [True, False] if provider == "DeepSeek" else [True]
         for use_response_format in response_format_options:
             try:
+                raise_if_cancelled()
                 kwargs = {"model": model, "messages": messages, "temperature": 0.05}
                 if use_response_format:
                     kwargs["response_format"] = {"type": "json_object"}
-                response = client.chat.completions.create(**kwargs)
+                response = run_cancellable_api_call(lambda: client.chat.completions.create(**kwargs))
+                raise_if_cancelled()
                 return parse_json_object(response.choices[0].message.content)
+            except TranslationCancelled:
+                raise
             except Exception as exc:
                 last_error = exc
         if attempt + 1 < retries:
-            time.sleep(2 + attempt * 3)
+            sleep_until = time.time() + 2 + attempt * 3
+            while time.time() < sleep_until:
+                raise_if_cancelled()
+                time.sleep(0.2)
     raise last_error
 
 
@@ -559,6 +614,8 @@ def make_company_name_glossary(client: OpenAI, provider: str, model: str, source
     ]
     try:
         data = chat_json(client, provider, model, messages, retries=2)
+    except TranslationCancelled:
+        raise
     except Exception as exc:
         log(f"{APP_VERSION} company glossary extraction failed; continuing without mandatory name glossary. Reason: {exc}")
         return []
@@ -838,6 +895,8 @@ def make_translation_memory(client: OpenAI, provider: str, model: str, source_ma
     ]
     try:
         return str(chat_json(client, provider, model, messages, retries=2).get("memory", "")).strip()
+    except TranslationCancelled:
+        raise
     except Exception as exc:
         log(f"术语记忆提取失败，将继续翻译。原因：{exc}")
         return ""
@@ -990,6 +1049,8 @@ def repair_chunk_translations(
         progress(completed, total, f"自修复漏翻/中文残留 {index}/{len(batches)}")
         try:
             repaired = repair_translation_batch(client, provider, model, memory, batch, font_instruction, company_glossary)
+        except TranslationCancelled:
+            raise
         except Exception as exc:
             log(f"批量自修复失败，改为逐段修复。原因：{exc}")
             repaired = {}
@@ -1007,6 +1068,8 @@ def repair_chunk_translations(
                 continue
             try:
                 single = repair_translation_batch(client, provider, model, memory, [block], font_instruction, company_glossary)
+            except TranslationCancelled:
+                raise
             except Exception as exc:
                 log(f"block {block_id} 单段自修复失败：{exc}")
                 continue
@@ -1052,6 +1115,8 @@ def repair_all_translations(
             progress(total - len(bad_blocks), total, f"全文自修复第 {round_index} 轮 {batch_index}/{len(batches)}")
             try:
                 repaired = repair_translation_batch(client, provider, model, memory, batch, font_instruction, company_glossary)
+            except TranslationCancelled:
+                raise
             except Exception as exc:
                 log(f"批量自修复失败，改为逐段修复。原因：{exc}")
                 repaired = {}
@@ -1071,6 +1136,8 @@ def repair_all_translations(
                     continue
                 try:
                     single = repair_translation_batch(client, provider, model, memory, [block], font_instruction, company_glossary)
+                except TranslationCancelled:
+                    raise
                 except Exception as exc:
                     log(f"block {block_id} 单段自修复失败：{exc}")
                     continue
@@ -1173,12 +1240,13 @@ def final_llm_audit_batch(
                 "What to flag:\n"
                 "- Untranslated Chinese legal prose, headings, labels, table cells, or sentence fragments.\n"
                 "- Chinese text appended to an otherwise English translation.\n"
-                "- Chinese-only company/person names when they are not paired with an English rendition in English Name (Chinese Name) form.\n\n"
-                "- Any company/institution name that appears in the source and is listed in the glossary but is not rendered in the translation as the required English Name (Chinese Name) form.\n\n"
+                "- Chinese legal text that remains mixed into an otherwise English sentence.\n\n"
                 "What not to flag:\n"
                 "- Chinese inside a translated proper-name parenthetical, e.g. Shanghai Example Technology Co., Ltd. (上海示例科技有限公司).\n"
+                "- Chinese company, fund, shareholder, investor, person, trademark, or brand names retained for legal identification.\n"
                 "- Original placeholders inside 【】 or blank placeholders.\n"
-                "- Chinese trademark/brand marks intentionally retained with English context.\n\n"
+                "- Chinese trademark/brand marks intentionally retained with English context.\n"
+                "- A company or fund name solely because it is not written as English Name (Chinese Name).\n\n"
                 f"COMPANY/INSTITUTION NAME GLOSSARY:\n{company_glossary}\n\n"
                 f"CAPITAL MARKETS LEGAL RAG:\n{legal_rag_for_text(rag_text)}\n\n"
                 f"BLOCKS JSON:\n{json.dumps({'blocks': payload}, ensure_ascii=False)}"
@@ -1230,6 +1298,8 @@ def final_llm_audit_and_repair_translations(
             progress(total, total, f"{APP_VERSION} final LLM audit {batch_index}")
             try:
                 issues.extend(final_llm_audit_batch(client, provider, model, batch, translations, company_entries, company_glossary))
+            except TranslationCancelled:
+                raise
             except Exception as exc:
                 log(f"{APP_VERSION} final LLM audit batch failed and was skipped: {exc}")
         if not issues:
@@ -1257,6 +1327,8 @@ def final_llm_audit_and_repair_translations(
             progress(total, total, f"{APP_VERSION} final LLM repair {round_index}-{batch_index}")
             try:
                 repaired = repair_translation_batch(client, provider, model, memory, batch, font_instruction, company_glossary)
+            except TranslationCancelled:
+                raise
             except Exception as exc:
                 log(f"{APP_VERSION} final LLM repair batch failed, trying single blocks. Reason: {exc}")
                 repaired = {}
@@ -1275,6 +1347,8 @@ def final_llm_audit_and_repair_translations(
                     continue
                 try:
                     single = repair_translation_batch(client, provider, model, memory, [block], font_instruction, company_glossary)
+                except TranslationCancelled:
+                    raise
                 except Exception as exc:
                     log(f"{APP_VERSION} final LLM single repair failed for block {block_id}: {exc}")
                     continue
@@ -1612,9 +1686,11 @@ def translate_docx_hybrid(
     english_font: str,
     chinese_font: str,
     log,
-    progress,
+    translation_progress,
+    review_progress,
     cancel_event: threading.Event | None = None,
 ) -> tuple[Path, Path, Path, Path, Path, bool]:
+    set_active_cancel_event(cancel_event)
     output_dir.mkdir(parents=True, exist_ok=True)
     english_font = valid_english_font(english_font)
     chinese_font = valid_chinese_font(chinese_font)
@@ -1642,10 +1718,16 @@ def translate_docx_hybrid(
 
     source_markdown = "\n\n".join(block["markdown"] for block in blocks)
     client = build_client(api_key, base_url)
-    report_progress(progress, 2, "正在抽取公司/机构名表...")
-    company_entries = make_company_name_glossary(client, provider, model, source_markdown, log)
-    company_glossary = company_glossary_to_prompt(company_entries)
-    report_progress(progress, 4, "正在生成术语记忆和翻译规则...")
+    report_progress(review_progress, 0, "等待翻译完成后开始复核检查")
+    if ENABLE_COMPANY_NAME_GLOSSARY:
+        report_progress(translation_progress, 2, "正在抽取公司/机构名表...")
+        company_entries = make_company_name_glossary(client, provider, model, source_markdown, log)
+        company_glossary = company_glossary_to_prompt(company_entries)
+    else:
+        company_entries = []
+        company_glossary = "(disabled; do not force English Name (Chinese Name) formatting)"
+        log(f"{APP_VERSION} 公司名强制“英文（中文）”纠错已关闭，避免复核阶段反复重翻。")
+    report_progress(translation_progress, 4, "正在生成术语记忆和翻译规则...")
     memory = make_translation_memory(client, provider, model, source_markdown, log, font_instruction, company_glossary)
     chunks = build_chunks(blocks)
     log(f"{APP_VERSION} 复合方法：{len(blocks)} 个中文 block，分为 {len(chunks)} 个 Markdown 大段批次。")
@@ -1667,8 +1749,14 @@ def translate_docx_hybrid(
         before = "\n\n".join(block["markdown"] for block in blocks[max(0, blocks.index(chunk[0]) - 3) : blocks.index(chunk[0])])
         after_start = blocks.index(chunk[-1]) + 1
         after = "\n\n".join(block["markdown"] for block in blocks[after_start : min(len(blocks), after_start + 3)])
-        report_phase(progress, 5, 58, completed, len(blocks), f"翻译 Markdown 大段 {chunk_index}/{len(chunks)}")
-        translated_markdown = translate_markdown_chunk(client, provider, model, memory, chunk_markdown, before, after, font_instruction, company_glossary)
+        report_phase(translation_progress, 5, 99, completed, len(blocks), f"翻译 Markdown 大段 {chunk_index}/{len(chunks)}")
+        try:
+            translated_markdown = translate_markdown_chunk(client, provider, model, memory, chunk_markdown, before, after, font_instruction, company_glossary)
+        except TranslationCancelled:
+            cancelled = True
+            log("收到中止请求；当前 API 批次不再等待，直接导出最近已完成进度。")
+            report_progress(review_progress, 85, "正在导出最近已完成进度")
+            break
         translated_markdown_parts.append(translated_markdown)
         chunk_translations = parse_translated_markdown(translated_markdown)
         for block in chunk:
@@ -1680,49 +1768,67 @@ def translate_docx_hybrid(
         if cancel_event and cancel_event.is_set():
             cancelled = True
             log("当前 Markdown 批次已完成；根据中止请求，开始导出当前进度。")
-            report_progress(progress, 98, "已中止，正在导出当前进度")
+            report_progress(review_progress, 85, "已中止，正在导出当前进度")
             break
-        report_phase(progress, 5, 58, completed, len(blocks), f"大段 {chunk_index}/{len(chunks)} 已完成")
+        report_phase(translation_progress, 5, 99, completed, len(blocks), f"大段 {chunk_index}/{len(chunks)} 已完成")
+    if not cancelled:
+        report_complete(translation_progress, "翻译完成，开始复核检查")
 
     if not cancelled:
-        auto_repaired_blocks.update(
-            repair_all_translations(
-                client,
-                provider,
-                model,
-                memory,
-                blocks,
-                translated_blocks,
-                log,
-                make_phase_progress(progress, 58, 72),
-                font_instruction,
-                company_glossary,
+        try:
+            auto_repaired_blocks.update(
+                repair_all_translations(
+                    client,
+                    provider,
+                    model,
+                    memory,
+                    blocks,
+                    translated_blocks,
+                    log,
+                    make_phase_progress(review_progress, 0, 35),
+                    font_instruction,
+                    company_glossary,
+                )
             )
-        )
-        final_audit_repaired_blocks.update(
-            final_llm_audit_and_repair_translations(
-                client,
-                provider,
-                model,
-                memory,
-                blocks,
-                translated_blocks,
-                log,
-                make_phase_progress(progress, 72, 86),
-                font_instruction,
-                company_entries,
-                company_glossary,
+        except TranslationCancelled:
+            cancelled = True
+            log("收到中止请求；漏翻自修复当前批次不再等待，直接导出最近已完成进度。")
+            report_progress(review_progress, 85, "正在导出最近已完成进度")
+    if not cancelled:
+        try:
+            final_audit_repaired_blocks.update(
+                final_llm_audit_and_repair_translations(
+                    client,
+                    provider,
+                    model,
+                    memory,
+                    blocks,
+                    translated_blocks,
+                    log,
+                    make_phase_progress(review_progress, 35, 65),
+                    font_instruction,
+                    company_entries,
+                    company_glossary,
+                )
             )
-        )
+        except TranslationCancelled:
+            cancelled = True
+            log("收到中止请求；最终复核当前批次不再等待，直接导出最近已完成进度。")
+            report_progress(review_progress, 85, "正在导出最近已完成进度")
     all_mappings = []
     for chunk_index, chunk in enumerate(chunks, start=1):
         ready_chunk = [block for block in chunk if translated_blocks.get(int(block["id"]), "").strip()]
         if not ready_chunk:
             continue
-        report_phase(progress, 86, 96, chunk_index - 1, len(chunks), f"映射格式 {chunk_index}/{len(chunks)}")
+        report_phase(review_progress, 65, 85, chunk_index - 1, len(chunks), f"映射格式 {chunk_index}/{len(chunks)}")
         chunk_translations = {int(block["id"]): translated_blocks.get(int(block["id"]), "") for block in ready_chunk}
-        all_mappings.extend(map_format_spans(client, provider, model, memory, ready_chunk, chunk_translations, font_instruction))
-        report_phase(progress, 86, 96, chunk_index, len(chunks), f"格式映射 {chunk_index}/{len(chunks)} 已完成")
+        try:
+            all_mappings.extend(map_format_spans(client, provider, model, memory, ready_chunk, chunk_translations, font_instruction))
+        except TranslationCancelled:
+            cancelled = True
+            log("收到中止请求；格式映射当前批次不再等待，直接导出最近已完成进度。")
+            break
+        report_phase(review_progress, 65, 85, chunk_index, len(chunks), f"格式映射 {chunk_index}/{len(chunks)} 已完成")
 
     mappings_by_span = {str(mapping.get("span_id")): mapping for mapping in all_mappings if mapping.get("span_id")}
     checklist = []
@@ -1740,7 +1846,7 @@ def translate_docx_hybrid(
         )
     for index, block in enumerate(blocks, start=1):
         if index == 1 or index == len(blocks) or index % 25 == 0:
-            report_phase(progress, 96, 98, index - 1, len(blocks), f"正在写入译文和格式 {index}/{len(blocks)}")
+            report_phase(review_progress, 85, 98, index - 1, len(blocks), f"正在写入译文和格式 {index}/{len(blocks)}")
         block_id = block["id"]
         translation = normalize_translation_against_source(block["text"], translated_blocks.get(block_id, "").strip())
         intervals = []
@@ -1769,7 +1875,7 @@ def translate_docx_hybrid(
                     "style": "",
                     "target_text": "",
                     "confidence": "llm-audit",
-                    "note": f"{APP_VERSION} final LLM audit found untranslated Chinese/CJK content or a glossary name-format issue and repaired this block before export.",
+                    "note": f"{APP_VERSION} final LLM audit found untranslated Chinese/CJK legal content and repaired this block before export.",
                 }
             )
         for public_span in block["format_spans"]:
@@ -1834,7 +1940,7 @@ def translate_docx_hybrid(
         if needs_translation_repair(block["text"], translation):
             checklist.append({"status": "HAS_CHINESE_IN_TRANSLATION", "block_id": block_id, "note": "译文仍疑似存在漏翻或大段中文残留。"})
         rewrite_paragraph(paragraphs[block_id], translation, intervals, english_font, chinese_font)
-    report_progress(progress, 98, "正在导出 Word 和明细文件...")
+    report_progress(review_progress, 98, "正在导出 Word 和明细文件...")
 
     base = input_path.stem
     suffix = "_已中止" if cancelled else ""
@@ -1868,7 +1974,7 @@ def translate_docx_hybrid(
         ),
         encoding="utf-8",
     )
-    report_complete(progress, "已中止并导出当前进度" if cancelled else "全部完成")
+    report_complete(review_progress, "已中止并导出当前进度" if cancelled else "全部完成")
     return docx_path, source_md_path, translated_md_path, checklist_path, json_path, cancelled
 
 
@@ -1940,12 +2046,18 @@ class HybridApp:
 
         progress_frame = Frame(root, padx=16, pady=8)
         progress_frame.pack(fill=X)
-        self.progress_text = StringVar(value="进度：0/0")
-        self.current_text = StringVar(value="当前：尚未开始")
-        Label(progress_frame, textvariable=self.progress_text).pack(anchor="w")
-        self.bar = Progressbar(progress_frame, maximum=100)
-        self.bar.pack(fill=X, pady=(4, 6))
-        Label(progress_frame, textvariable=self.current_text, wraplength=820, justify=LEFT).pack(anchor="w")
+        self.translation_progress_text = StringVar(value="翻译进度：0/100（0.0%）")
+        self.translation_current_text = StringVar(value="翻译：尚未开始")
+        self.review_progress_text = StringVar(value="复核检查：0/100（0.0%）")
+        self.review_current_text = StringVar(value="复核：等待翻译完成")
+        Label(progress_frame, textvariable=self.translation_progress_text).pack(anchor="w")
+        self.translation_bar = Progressbar(progress_frame, maximum=100)
+        self.translation_bar.pack(fill=X, pady=(4, 4))
+        Label(progress_frame, textvariable=self.translation_current_text, wraplength=820, justify=LEFT).pack(anchor="w")
+        Label(progress_frame, textvariable=self.review_progress_text).pack(anchor="w", pady=(8, 0))
+        self.review_bar = Progressbar(progress_frame, maximum=100)
+        self.review_bar.pack(fill=X, pady=(4, 4))
+        Label(progress_frame, textvariable=self.review_current_text, wraplength=820, justify=LEFT).pack(anchor="w")
 
         action = Frame(root, padx=16, pady=8)
         action.pack(fill=X)
@@ -1987,14 +2099,24 @@ class HybridApp:
         self.log_box.see(END)
         self.root.update_idletasks()
 
-    def update_progress(self, done: int, total: int, current: str):
+    def update_translation_progress(self, done: int, total: int, current: str):
         if threading.get_ident() != self.main_thread_id:
-            self.root.after(0, self.update_progress, done, total, current)
+            self.root.after(0, self.update_translation_progress, done, total, current)
             return
         percent = 0 if total <= 0 else max(0, min(100, done * 100 / total))
-        self.bar["value"] = percent
-        self.progress_text.set(f"进度：{done}/{total}（{percent:.1f}%）")
-        self.current_text.set(f"当前：{current}")
+        self.translation_bar["value"] = percent
+        self.translation_progress_text.set(f"翻译进度：{done}/{total}（{percent:.1f}%）")
+        self.translation_current_text.set(f"翻译：{current}")
+        self.root.update_idletasks()
+
+    def update_review_progress(self, done: int, total: int, current: str):
+        if threading.get_ident() != self.main_thread_id:
+            self.root.after(0, self.update_review_progress, done, total, current)
+            return
+        percent = 0 if total <= 0 else max(0, min(100, done * 100 / total))
+        self.review_bar["value"] = percent
+        self.review_progress_text.set(f"复核检查：{done}/{total}（{percent:.1f}%）")
+        self.review_current_text.set(f"复核：{current}")
         self.root.update_idletasks()
 
     def start(self):
@@ -2024,6 +2146,8 @@ class HybridApp:
         self.cancel_event.clear()
         self.start_button.config(state="disabled")
         self.stop_button.config(state="normal")
+        self.update_translation_progress(0, PROGRESS_TOTAL, "准备开始")
+        self.update_review_progress(0, PROGRESS_TOTAL, "等待翻译完成")
         thread = threading.Thread(
             target=self.worker,
             args=(input_path, output_dir, provider, api_key, base_url, model, english_font, chinese_font),
@@ -2034,8 +2158,8 @@ class HybridApp:
     def request_cancel(self):
         self.cancel_event.set()
         self.stop_button.config(state="disabled")
-        self.log("已请求中止；当前 API 批次返回后会导出当前进度。")
-        self.update_progress(0, 0, "正在等待当前批次返回，然后导出当前进度...")
+        self.log("已请求中止；将不再等待当前 API 批次返回，直接导出最近已完成进度。")
+        self.update_review_progress(85, PROGRESS_TOTAL, "正在中止并导出最近已完成进度...")
 
     def worker(
         self,
@@ -2059,10 +2183,14 @@ class HybridApp:
                 english_font,
                 chinese_font,
                 self.log,
-                self.update_progress,
+                self.update_translation_progress,
+                self.update_review_progress,
                 self.cancel_event,
             )
             self.root.after(0, self.finish_success, paths[:-1], paths[-1])
+        except TranslationCancelled:
+            self.log("已中止；当前还没有完成可导出的翻译批次。")
+            self.root.after(0, self.finish_error, "已中止；当前还没有完成可导出的翻译批次。")
         except Exception as exc:
             self.log("发生错误：")
             self.log(str(exc))
