@@ -634,6 +634,135 @@ def translate_markdown_chunk(client: OpenAI, provider: str, model: str, memory: 
     return str(chat_json(client, provider, model, messages).get("markdown", "")).strip()
 
 
+def cjk_count(text: str) -> int:
+    return len(re.findall(r"[\u3400-\u9fff]", text or ""))
+
+
+def needs_translation_repair(source_text: str, translation: str) -> bool:
+    translation = translation or ""
+    if not translation.strip():
+        return True
+    count = cjk_count(translation)
+    if not count:
+        return False
+    compact_len = max(1, len(re.sub(r"\s+", "", translation)))
+    source_count = max(1, cjk_count(source_text))
+    ascii_letters = len(re.findall(r"[A-Za-z]", translation))
+    if count >= 4 and count / compact_len >= 0.5 and ascii_letters < 10:
+        return True
+    return (count >= 20 and count / compact_len >= 0.08) or count >= max(30, source_count // 4)
+
+
+def build_repair_batches(blocks: list[dict], max_chars: int = 12000, max_blocks: int = 8) -> list[list[dict]]:
+    batches = []
+    current = []
+    current_chars = 0
+    for block in blocks:
+        size = len(block.get("text", "")) + 200
+        if current and (current_chars + size > max_chars or len(current) >= max_blocks):
+            batches.append(current)
+            current = []
+            current_chars = 0
+        current.append(block)
+        current_chars += size
+    if current:
+        batches.append(current)
+    return batches
+
+
+def repair_translation_batch(client: OpenAI, provider: str, model: str, memory: str, batch: list[dict]) -> dict[int, str]:
+    payload = [{"id": block["id"], "source_text": block["text"]} for block in batch]
+    source_text = "\n".join(item["source_text"] for item in payload)
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                "Repair missing or incomplete translations for these Chinese legal contract blocks.\n"
+                "Return JSON exactly like {\"translations\":[{\"id\":123,\"translation\":\"...\"}]}.\n"
+                "Rules:\n"
+                "1. Return one translation for every input id.\n"
+                "2. Translate all Chinese legal prose into formal legal English.\n"
+                "3. Do not leave Chinese prose in the translation.\n"
+                "4. Proper names may use the format English Name (Chinese Name) where appropriate; brand marks in quoted lists may retain Chinese characters when they are the mark itself.\n"
+                "5. Preserve numbers, defined terms, brackets, placeholders, clause references, and round names such as B5 Round / Pre-IPO Round.\n\n"
+                f"CAPITAL MARKETS LEGAL RAG:\n{legal_rag_for_text(source_text)}\n\n"
+                f"TRANSLATION MEMORY:\n{memory or '(none)'}\n\n"
+                f"BLOCKS JSON:\n{json.dumps({'blocks': payload}, ensure_ascii=False)}"
+            ),
+        },
+    ]
+    data = chat_json(client, provider, model, messages, retries=2)
+    repaired = {}
+    for item in data.get("translations", []) or []:
+        try:
+            block_id = int(item.get("id"))
+        except (TypeError, ValueError):
+            continue
+        translation = str(item.get("translation", "")).strip()
+        if translation:
+            repaired[block_id] = translation
+    return repaired
+
+
+def repair_chunk_translations(
+    client: OpenAI,
+    provider: str,
+    model: str,
+    memory: str,
+    chunk: list[dict],
+    translations: dict[int, str],
+    log,
+    progress,
+    completed: int,
+    total: int,
+) -> set[int]:
+    block_by_id = {int(block["id"]): block for block in chunk}
+    bad_blocks = []
+    for block in chunk:
+        block_id = int(block["id"])
+        translation = translations.get(block_id, "")
+        if needs_translation_repair(block["text"], translation):
+            bad_blocks.append(block)
+    if not bad_blocks:
+        return set()
+
+    repaired_ids: set[int] = set()
+    ids = ", ".join(str(block["id"]) for block in bad_blocks[:12])
+    more = "..." if len(bad_blocks) > 12 else ""
+    log(f"自检查发现 {len(bad_blocks)} 个 block 漏翻或中文残留，自动拆分重翻：{ids}{more}")
+    batches = build_repair_batches(bad_blocks)
+    for index, batch in enumerate(batches, start=1):
+        progress(completed, total, f"自修复漏翻/中文残留 {index}/{len(batches)}")
+        try:
+            repaired = repair_translation_batch(client, provider, model, memory, batch)
+        except Exception as exc:
+            log(f"批量自修复失败，改为逐段修复。原因：{exc}")
+            repaired = {}
+        for block_id, translation in repaired.items():
+            block = block_by_id.get(block_id)
+            if not block:
+                continue
+            translation = normalize_translation_against_source(block["text"], translation)
+            if translation and not needs_translation_repair(block["text"], translation):
+                translations[block_id] = translation
+                repaired_ids.add(block_id)
+        for block in batch:
+            block_id = int(block["id"])
+            if block_id in repaired_ids and not needs_translation_repair(block["text"], translations.get(block_id, "")):
+                continue
+            try:
+                single = repair_translation_batch(client, provider, model, memory, [block])
+            except Exception as exc:
+                log(f"block {block_id} 单段自修复失败：{exc}")
+                continue
+            translation = normalize_translation_against_source(block["text"], single.get(block_id, ""))
+            if translation:
+                translations[block_id] = translation
+                repaired_ids.add(block_id)
+    return repaired_ids
+
+
 def map_format_spans(client: OpenAI, provider: str, model: str, memory: str, source_blocks: list[dict], translated_blocks: dict[int, str]) -> list[dict]:
     payload = []
     for block in source_blocks:
@@ -915,6 +1044,7 @@ def translate_docx_hybrid(
     translated_blocks: dict[int, str] = {}
     translated_markdown_parts = []
     all_mappings = []
+    auto_repaired_blocks: set[int] = set()
     completed = 0
     cancelled = False
     for chunk_index, chunk in enumerate(chunks, start=1):
@@ -934,6 +1064,37 @@ def translate_docx_hybrid(
             block_id = int(block["id"])
             if block_id in chunk_translations:
                 chunk_translations[block_id] = normalize_translation_against_source(block["text"], chunk_translations[block_id])
+        if not (cancel_event and cancel_event.is_set()):
+            auto_repaired_blocks.update(
+                repair_chunk_translations(
+                    client,
+                    provider,
+                    model,
+                    memory,
+                    chunk,
+                    chunk_translations,
+                    log,
+                    progress,
+                    completed,
+                    len(blocks),
+                )
+            )
+            still_missing = [str(block["id"]) for block in chunk if not chunk_translations.get(int(block["id"]), "").strip()]
+            if still_missing:
+                raise RuntimeError(
+                    "自检查自修复后仍有 block 没有译文，已停止导出，避免生成含中文的文件。"
+                    f" 未完成 block: {', '.join(still_missing[:20])}{'...' if len(still_missing) > 20 else ''}"
+                )
+            still_bad = [
+                str(block["id"])
+                for block in chunk
+                if needs_translation_repair(block["text"], chunk_translations.get(int(block["id"]), ""))
+            ]
+            if still_bad:
+                raise RuntimeError(
+                    "自检查自修复后仍有 block 疑似中文残留，已停止导出，避免生成含中文的文件。"
+                    f" 疑似问题 block: {', '.join(still_bad[:20])}{'...' if len(still_bad) > 20 else ''}"
+                )
         translated_blocks.update(chunk_translations)
         all_mappings.extend(map_format_spans(client, provider, model, memory, chunk, chunk_translations))
         completed += len(chunk)
@@ -966,6 +1127,18 @@ def translate_docx_hybrid(
         if not translation:
             checklist.append({"status": "MISSING_TRANSLATION", "block_id": block_id, "note": "模型没有返回该 block 的译文。"})
             continue
+        if block_id in auto_repaired_blocks:
+            checklist.append(
+                {
+                    "status": "AUTO_REPAIRED_TRANSLATION",
+                    "block_id": block_id,
+                    "source_text": "",
+                    "style": "",
+                    "target_text": "",
+                    "confidence": "deterministic",
+                    "note": "自检查发现漏翻或中文残留后，已在导出前自动重翻该 block。",
+                }
+            )
         for public_span in block["format_spans"]:
             span_id = public_span["span_id"]
             span = spans_by_id[span_id]
@@ -1025,8 +1198,8 @@ def translate_docx_hybrid(
             occupied.append((start, end))
             row["status"] = "APPLIED"
             checklist.append(row)
-        if has_cjk(translation):
-            checklist.append({"status": "HAS_CHINESE_IN_TRANSLATION", "block_id": block_id, "note": "译文仍检测到中文。"})
+        if needs_translation_repair(block["text"], translation):
+            checklist.append({"status": "HAS_CHINESE_IN_TRANSLATION", "block_id": block_id, "note": "译文仍疑似存在漏翻或大段中文残留。"})
         rewrite_paragraph(paragraphs[block_id], translation, intervals)
 
     base = input_path.stem

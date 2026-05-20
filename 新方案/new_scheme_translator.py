@@ -590,6 +590,72 @@ def translate_single_item(client: OpenAI, provider: str, model: str, memory: str
     return translate_chunk(client, provider, model, memory, [item], context_before, context_after)
 
 
+def cjk_count(text: str) -> int:
+    return len(re.findall(r"[\u3400-\u9fff]", text or ""))
+
+
+def needs_translation_repair(source_text: str, translation: str) -> bool:
+    translation = translation or ""
+    if not translation.strip():
+        return True
+    count = cjk_count(translation)
+    if not count:
+        return False
+    compact_len = max(1, len(re.sub(r"\s+", "", translation)))
+    source_count = max(1, cjk_count(source_text))
+    ascii_letters = len(re.findall(r"[A-Za-z]", translation))
+    if count >= 4 and count / compact_len >= 0.5 and ascii_letters < 10:
+        return True
+    return (count >= 20 and count / compact_len >= 0.08) or count >= max(30, source_count // 4)
+
+
+def repair_chunk_results(
+    client: OpenAI,
+    provider: str,
+    model: str,
+    memory: str,
+    chunk: list[dict],
+    results: dict[int, dict],
+    context_before: str,
+    context_after: str,
+    log,
+) -> set[int]:
+    repaired_ids: set[int] = set()
+    bad_items = []
+    for item in chunk:
+        item_id = int(item["id"])
+        result = results.get(item_id)
+        translation = "" if not result else str(result.get("translation", "")).strip()
+        if needs_translation_repair(item["text"], translation):
+            bad_items.append(item)
+    if not bad_items:
+        return repaired_ids
+    ids = ", ".join(str(item["id"] + 1) for item in bad_items[:12])
+    more = "..." if len(bad_items) > 12 else ""
+    log(f"自检查发现 {len(bad_items)} 个段落漏翻或中文残留，自动逐段重翻：{ids}{more}")
+    for item in bad_items:
+        item_id = int(item["id"])
+        try:
+            data = translate_single_item(client, provider, model, memory, item, context_before, context_after)
+        except Exception as exc:
+            log(f"段落 {item_id + 1} 自修复重翻失败：{exc}")
+            continue
+        for paragraph_result in data.get("paragraphs", []) or []:
+            try:
+                paragraph_id = int(paragraph_result.get("id"))
+            except (TypeError, ValueError):
+                continue
+            if paragraph_id != item_id:
+                continue
+            translation = normalize_translation_against_source(item["text"], str(paragraph_result.get("translation", "")).strip())
+            paragraph_result["translation"] = translation
+            if translation:
+                results[item_id] = paragraph_result
+                repaired_ids.add(item_id)
+            break
+    return repaired_ids
+
+
 def normalize_spaces(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
@@ -825,6 +891,7 @@ def translate_docx_new_scheme(
     log(f"发现 {len(targets)} 个含中文段落，分为 {len(chunks)} 个大段翻译批次。")
 
     all_results = {}
+    auto_repaired_paragraphs: set[int] = set()
     completed = 0
     cancelled = False
     for chunk_number, chunk in enumerate(chunks, start=1):
@@ -848,6 +915,26 @@ def translate_docx_new_scheme(
                 data["paragraphs"].extend(single.get("paragraphs", []))
         for paragraph_result in data.get("paragraphs", []):
             all_results[int(paragraph_result.get("id"))] = paragraph_result
+        if not (cancel_event and cancel_event.is_set()):
+            auto_repaired_paragraphs.update(
+                repair_chunk_results(client, provider, model, memory, chunk, all_results, context_before, context_after, log)
+            )
+            still_missing = [str(int(item["id"]) + 1) for item in chunk if not all_results.get(int(item["id"]), {}).get("translation", "").strip()]
+            if still_missing:
+                raise RuntimeError(
+                    "自检查自修复后仍有段落没有译文，已停止导出，避免生成含中文的文件。"
+                    f" 未完成段落: {', '.join(still_missing[:20])}{'...' if len(still_missing) > 20 else ''}"
+                )
+            still_bad = [
+                str(int(item["id"]) + 1)
+                for item in chunk
+                if needs_translation_repair(item["text"], str(all_results.get(int(item["id"]), {}).get("translation", "")).strip())
+            ]
+            if still_bad:
+                raise RuntimeError(
+                    "自检查自修复后仍有段落疑似中文残留，已停止导出，避免生成含中文的文件。"
+                    f" 疑似问题段落: {', '.join(still_bad[:20])}{'...' if len(still_bad) > 20 else ''}"
+                )
         completed += len(chunk)
         progress(completed, len(targets), f"第 {chunk_number}/{len(chunks)} 个大段已返回。")
         if cancel_event and cancel_event.is_set():
@@ -889,6 +976,18 @@ def translate_docx_new_scheme(
             continue
 
         translation = normalize_translation_against_source(item["text"], str(result.get("translation", "")).strip())
+        if paragraph_id in auto_repaired_paragraphs:
+            checklist_rows.append(
+                {
+                    "status": "AUTO_REPAIRED_TRANSLATION",
+                    "paragraph_id": paragraph_id + 1,
+                    "source_text": "",
+                    "style": "",
+                    "target_text": "",
+                    "confidence": "deterministic",
+                    "note": "自检查发现漏翻或中文残留后，已在导出前自动重翻该段。",
+                }
+            )
         mappings = result.get("format_mappings", []) or []
         mappings_by_span = {str(mapping.get("span_id")): mapping for mapping in mappings if mapping.get("span_id")}
         intervals = []
@@ -955,7 +1054,7 @@ def translate_docx_new_scheme(
             row["status"] = "APPLIED"
             checklist_rows.append(row)
 
-        if has_cjk(translation):
+        if needs_translation_repair(item["text"], translation):
             checklist_rows.append(
                 {
                     "status": "HAS_CHINESE_IN_TRANSLATION",
@@ -964,7 +1063,7 @@ def translate_docx_new_scheme(
                     "style": "",
                     "target_text": "",
                     "confidence": "",
-                    "note": "译文仍检测到中文，请人工复核。",
+                    "note": "译文仍疑似存在漏翻或大段中文残留，请人工复核。",
                 }
             )
         rewrite_paragraph_with_format(paragraphs[paragraph_id], translation, intervals)
