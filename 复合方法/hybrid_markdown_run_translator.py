@@ -34,7 +34,7 @@ PROVIDER_DEFAULTS = {
     "OpenAI": {"base_url": "", "model": "gpt-4.1", "key_label": "OpenAI API Key"},
     "DeepSeek": {"base_url": "https://api.deepseek.com", "model": "deepseek-v4-flash", "key_label": "DeepSeek API Key"},
 }
-APP_VERSION = "v1.7"
+APP_VERSION = "v1.8"
 ENGLISH_FONT_OPTIONS = ("Times New Roman", "Calibri")
 CHINESE_FONT_OPTIONS = ("楷体_GB2312", "宋体")
 DEFAULT_ENGLISH_FONT = "Times New Roman"
@@ -79,6 +79,29 @@ LEGAL_RAG_TERMS = [
     ("\u76ee\u6807\u516c\u53f8", "\u76ee\u6807\u516c\u53f8 = Target Company."),
     ("\u96c6\u56e2\u516c\u53f8", "\u96c6\u56e2\u516c\u53f8 = Group Company / Group Companies."),
 ]
+
+ORG_NAME_SUFFIXES = (
+    "\u80a1\u4efd\u6709\u9650\u516c\u53f8",
+    "\u6709\u9650\u8d23\u4efb\u516c\u53f8",
+    "\u6709\u9650\u516c\u53f8",
+    "\u5408\u4f19\u4f01\u4e1a\uff08\u6709\u9650\u5408\u4f19\uff09",
+    "\u5408\u4f19\u4f01\u4e1a(\u6709\u9650\u5408\u4f19)",
+    "\u5408\u4f19\u4f01\u4e1a",
+    "\u6709\u9650\u5408\u4f19",
+    "\u57fa\u91d1",
+    "\u96c6\u56e2",
+    "\u4e2d\u5fc3",
+    "\u516c\u53f8",
+)
+GENERIC_ORG_NAMES = {
+    "\u76ee\u6807\u516c\u53f8",
+    "\u96c6\u56e2\u516c\u53f8",
+    "\u516c\u53f8",
+    "\u672c\u516c\u53f8",
+    "\u5404\u96c6\u56e2\u516c\u53f8",
+    "\u6295\u8d44\u4eba",
+    "\u80a1\u4e1c",
+}
 
 CHINESE_NUMERAL_ROMAN = {
     "\u4e00": "I",
@@ -164,6 +187,79 @@ def legal_rag_for_text(text: str) -> str:
     if not retrieved:
         return CAPITAL_MARKETS_LEGAL_RAG
     return CAPITAL_MARKETS_LEGAL_RAG + "\n\nRetrieved terms for this chunk:\n- " + "\n- ".join(retrieved)
+
+
+def clean_company_source_name(name: str) -> str:
+    name = re.sub(r"\s+", "", name or "")
+    name = name.strip(" \t\r\n,.;:!?()[]{}<>\"'")
+    name = name.strip("\u3001\uff0c\u3002\uff1b\uff1a\uff08\uff09\u3010\u3011\u300a\u300b\u201c\u201d\u2018\u2019")
+    return name
+
+
+def is_likely_chinese_org_name(name: str) -> bool:
+    name = clean_company_source_name(name)
+    if not name or name in GENERIC_ORG_NAMES:
+        return False
+    if len(name) < 4 or not has_cjk(name):
+        return False
+    if any(word in name for word in ("\u672c\u534f\u8bae", "\u672c\u6b21\u4ea4\u6613", "\u8463\u4e8b\u4f1a", "\u5de5\u5546\u884c\u653f")):
+        return False
+    return any(suffix in name for suffix in ORG_NAME_SUFFIXES)
+
+
+ORG_CANDIDATE_RE = re.compile(
+    r"[\u4e00-\u9fff][\u4e00-\u9fffA-Za-z0-9\uff08\uff09()·\-\u00b7]{1,70}?"
+    r"(?:\u80a1\u4efd\u6709\u9650\u516c\u53f8|\u6709\u9650\u8d23\u4efb\u516c\u53f8|\u6709\u9650\u516c\u53f8|"
+    r"\u5408\u4f19\u4f01\u4e1a\uff08\u6709\u9650\u5408\u4f19\uff09|\u5408\u4f19\u4f01\u4e1a\(\u6709\u9650\u5408\u4f19\)|"
+    r"\u5408\u4f19\u4f01\u4e1a|\u6709\u9650\u5408\u4f19|\u57fa\u91d1|\u96c6\u56e2|\u4e2d\u5fc3|\u516c\u53f8)"
+)
+
+
+def extract_company_name_candidates(text: str, limit: int = 250) -> list[str]:
+    names = []
+    seen = set()
+    for match in ORG_CANDIDATE_RE.finditer(text or ""):
+        name = clean_company_source_name(match.group(0))
+        if not is_likely_chinese_org_name(name) or name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+        if len(names) >= limit:
+            break
+    return names
+
+
+def clean_company_english_name(name: str, source_name: str) -> str:
+    name = normalize_legal_english(name or "")
+    source_name = clean_company_source_name(source_name)
+    if source_name:
+        name = name.replace(source_name, "")
+        name = re.sub(r"\(\s*\)", "", name)
+    name = re.sub(r"[\u3400-\u9fff]+", "", name)
+    name = re.sub(r"\s+", " ", name)
+    return name.strip(" -_,;:()[]{}")
+
+
+def make_company_required_text(source_name: str, english_name: str) -> str:
+    source_name = clean_company_source_name(source_name)
+    english_name = clean_company_english_name(english_name, source_name)
+    if not source_name or not english_name:
+        return ""
+    return f"{english_name} ({source_name})"
+
+
+def company_glossary_to_prompt(entries: list[dict]) -> str:
+    if not entries:
+        return "(none)"
+    lines = [
+        "Mandatory company/institution name glossary. Whenever the Chinese source name appears in a block, the English translation must include the required rendering exactly, unless the source itself already supplies a different official English name:"
+    ]
+    for entry in entries[:300]:
+        source_name = entry.get("source_name", "")
+        required_text = entry.get("required_text", "")
+        if source_name and required_text:
+            lines.append(f"- {source_name} => {required_text}")
+    return "\n".join(lines)
 
 
 def valid_english_font(font_name: str) -> str:
@@ -407,6 +503,62 @@ def chat_json(client: OpenAI, provider: str, model: str, messages: list[dict], r
     raise last_error
 
 
+def make_company_name_glossary(client: OpenAI, provider: str, model: str, source_text: str, log) -> list[dict]:
+    candidates = extract_company_name_candidates(source_text)
+    if not candidates:
+        return []
+    log(f"{APP_VERSION} extracting company/institution name glossary: {len(candidates)} candidates.")
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                "Extract a mandatory company/institution name glossary for a Chinese capital-markets legal translation.\n"
+                "Return JSON exactly like {\"entries\":[{\"source_name\":\"中文全称\",\"english_name\":\"Official or best legal English name\"}]}.\n\n"
+                "Rules:\n"
+                "1. Include complete Chinese legal entity, fund, partnership, shareholder, investor, institution, and group company names.\n"
+                "2. Exclude generic legal terms such as 目标公司, 集团公司, 投资人, 股东, 公司, 本公司.\n"
+                "3. Prefer the official English name that would appear on Qichacha or in corporate registration records when known.\n"
+                "4. If the official English name is unknown, provide a conservative legal English rendering or pinyin-style legal name, but do not omit the entry.\n"
+                "5. english_name must not include the Chinese source name or Chinese parentheses; the program will append the Chinese name.\n\n"
+                f"SOURCE CANDIDATES:\n{json.dumps(candidates, ensure_ascii=False)}\n\n"
+                f"SOURCE EXCERPT:\n{compact_text(source_text, 70000)}"
+            ),
+        },
+    ]
+    try:
+        data = chat_json(client, provider, model, messages, retries=2)
+    except Exception as exc:
+        log(f"{APP_VERSION} company glossary extraction failed; continuing without mandatory name glossary. Reason: {exc}")
+        return []
+
+    entries = []
+    seen = set()
+    for item in data.get("entries", []) or []:
+        source_name = clean_company_source_name(str(item.get("source_name", "")))
+        english_name = str(item.get("english_name", "")).strip()
+        if not is_likely_chinese_org_name(source_name) or source_name in seen:
+            continue
+        if source_name not in source_text:
+            continue
+        required_text = make_company_required_text(source_name, english_name)
+        if not required_text:
+            continue
+        seen.add(source_name)
+        entries.append(
+            {
+                "source_name": source_name,
+                "english_name": clean_company_english_name(english_name, source_name),
+                "required_text": required_text,
+            }
+        )
+    if entries:
+        log(f"{APP_VERSION} company/institution glossary ready: {len(entries)} mandatory names.")
+    else:
+        log(f"{APP_VERSION} company/institution glossary returned no usable entries.")
+    return entries
+
+
 def iter_table_paragraphs(table, seen):
     for row in table.rows:
         for cell in row.cells:
@@ -637,7 +789,7 @@ def build_chunks(blocks: list[dict], max_chars: int = 35000, max_blocks: int = 4
     return chunks
 
 
-def make_translation_memory(client: OpenAI, provider: str, model: str, source_markdown: str, log, font_instruction: str) -> str:
+def make_translation_memory(client: OpenAI, provider: str, model: str, source_markdown: str, log, font_instruction: str, company_glossary: str) -> str:
     log("正在基于 Markdown 结构提取术语表和翻译规则...")
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -647,6 +799,7 @@ def make_translation_memory(client: OpenAI, provider: str, model: str, source_ma
                 "Create a concise bilingual translation memory for this Chinese legal contract represented as Markdown blocks.\n"
                 "Return JSON {\"memory\":\"...\"}. Include defined terms, parties, recurring phrases, bracket placeholders, and legal drafting preferences.\n\n"
                 f"FONT INSTRUCTIONS:\n{font_instruction}\n\n"
+                f"COMPANY/INSTITUTION NAME GLOSSARY:\n{company_glossary}\n\n"
                 f"CAPITAL MARKETS LEGAL RAG:\n{legal_rag_for_text(source_markdown)}\n\n"
                 f"MARKDOWN:\n{compact_text(source_markdown, 60000)}"
             ),
@@ -668,6 +821,7 @@ def translate_markdown_chunk(
     before: str,
     after: str,
     font_instruction: str,
+    company_glossary: str,
 ) -> str:
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -687,6 +841,7 @@ def translate_markdown_chunk(
                 "B. Translate under the Markdown structure first so the English keeps context and legal coherence.\n"
                 "C. Keep each BLOCK independent after translation because run-level formatting will be checked and applied block by block.\n\n"
                 f"FONT INSTRUCTIONS:\n{font_instruction}\n\n"
+                f"COMPANY/INSTITUTION NAME GLOSSARY:\n{company_glossary}\n\n"
                 f"CAPITAL MARKETS LEGAL RAG:\n{legal_rag_for_text(chunk_markdown)}\n\n"
                 f"TRANSLATION MEMORY:\n{memory or '(none)'}\n\n"
                 f"CONTEXT BEFORE:\n{compact_text(before, 3000)}\n\n"
@@ -734,7 +889,7 @@ def build_repair_batches(blocks: list[dict], max_chars: int = 12000, max_blocks:
     return batches
 
 
-def repair_translation_batch(client: OpenAI, provider: str, model: str, memory: str, batch: list[dict], font_instruction: str) -> dict[int, str]:
+def repair_translation_batch(client: OpenAI, provider: str, model: str, memory: str, batch: list[dict], font_instruction: str, company_glossary: str) -> dict[int, str]:
     payload = [{"id": block["id"], "source_text": block["text"]} for block in batch]
     source_text = "\n".join(item["source_text"] for item in payload)
     messages = [
@@ -751,6 +906,7 @@ def repair_translation_batch(client: OpenAI, provider: str, model: str, memory: 
                 "4. Proper names may use the format English Name (Chinese Name) where appropriate; brand marks in quoted lists may retain Chinese characters when they are the mark itself.\n"
                 "5. Preserve numbers, defined terms, brackets, placeholders, clause references, and round names such as B5 Round / Pre-IPO Round.\n\n"
                 f"FONT INSTRUCTIONS:\n{font_instruction}\n\n"
+                f"COMPANY/INSTITUTION NAME GLOSSARY:\n{company_glossary}\n\n"
                 f"CAPITAL MARKETS LEGAL RAG:\n{legal_rag_for_text(source_text)}\n\n"
                 f"TRANSLATION MEMORY:\n{memory or '(none)'}\n\n"
                 f"BLOCKS JSON:\n{json.dumps({'blocks': payload}, ensure_ascii=False)}"
@@ -782,6 +938,7 @@ def repair_chunk_translations(
     completed: int,
     total: int,
     font_instruction: str,
+    company_glossary: str,
 ) -> set[int]:
     block_by_id = {int(block["id"]): block for block in chunk}
     bad_blocks = []
@@ -801,7 +958,7 @@ def repair_chunk_translations(
     for index, batch in enumerate(batches, start=1):
         progress(completed, total, f"自修复漏翻/中文残留 {index}/{len(batches)}")
         try:
-            repaired = repair_translation_batch(client, provider, model, memory, batch, font_instruction)
+            repaired = repair_translation_batch(client, provider, model, memory, batch, font_instruction, company_glossary)
         except Exception as exc:
             log(f"批量自修复失败，改为逐段修复。原因：{exc}")
             repaired = {}
@@ -818,7 +975,7 @@ def repair_chunk_translations(
             if block_id in repaired_ids and not needs_translation_repair(block["text"], translations.get(block_id, "")):
                 continue
             try:
-                single = repair_translation_batch(client, provider, model, memory, [block], font_instruction)
+                single = repair_translation_batch(client, provider, model, memory, [block], font_instruction, company_glossary)
             except Exception as exc:
                 log(f"block {block_id} 单段自修复失败：{exc}")
                 continue
@@ -839,6 +996,7 @@ def repair_all_translations(
     log,
     progress,
     font_instruction: str,
+    company_glossary: str,
     max_rounds: int = 5,
 ) -> set[int]:
     repaired_ids: set[int] = set()
@@ -862,7 +1020,7 @@ def repair_all_translations(
         for batch_index, batch in enumerate(batches, start=1):
             progress(total - len(bad_blocks), total, f"全文自修复第 {round_index} 轮 {batch_index}/{len(batches)}")
             try:
-                repaired = repair_translation_batch(client, provider, model, memory, batch, font_instruction)
+                repaired = repair_translation_batch(client, provider, model, memory, batch, font_instruction, company_glossary)
             except Exception as exc:
                 log(f"批量自修复失败，改为逐段修复。原因：{exc}")
                 repaired = {}
@@ -881,7 +1039,7 @@ def repair_all_translations(
                 if not needs_translation_repair(block["text"], translations.get(block_id, "")):
                     continue
                 try:
-                    single = repair_translation_batch(client, provider, model, memory, [block], font_instruction)
+                    single = repair_translation_batch(client, provider, model, memory, [block], font_instruction, company_glossary)
                 except Exception as exc:
                     log(f"block {block_id} 单段自修复失败：{exc}")
                     continue
@@ -923,12 +1081,40 @@ def build_final_audit_batches(blocks: list[dict], translations: dict[int, str], 
     return batches
 
 
+def deterministic_company_name_audit_issues(batch: list[dict], translations: dict[int, str], company_entries: list[dict]) -> list[dict]:
+    issues = []
+    if not company_entries:
+        return issues
+    for block in batch:
+        block_id = int(block["id"])
+        source_text = block.get("text", "")
+        translation = translations.get(block_id, "")
+        for entry in company_entries:
+            source_name = entry.get("source_name", "")
+            required_text = entry.get("required_text", "")
+            if not source_name or source_name not in source_text:
+                continue
+            if source_name in translation:
+                continue
+            issues.append(
+                {
+                    "id": block_id,
+                    "reason": f"Company/institution name must follow glossary rendering: {required_text}",
+                    "chinese_fragment": source_name,
+                }
+            )
+            break
+    return issues
+
+
 def final_llm_audit_batch(
     client: OpenAI,
     provider: str,
     model: str,
     batch: list[dict],
     translations: dict[int, str],
+    company_entries: list[dict],
+    company_glossary: str,
 ) -> list[dict]:
     payload = []
     rag_text_parts = []
@@ -957,10 +1143,12 @@ def final_llm_audit_batch(
                 "- Untranslated Chinese legal prose, headings, labels, table cells, or sentence fragments.\n"
                 "- Chinese text appended to an otherwise English translation.\n"
                 "- Chinese-only company/person names when they are not paired with an English rendition in English Name (Chinese Name) form.\n\n"
+                "- Any company/institution name that appears in the source and is listed in the glossary but is not rendered in the translation as the required English Name (Chinese Name) form.\n\n"
                 "What not to flag:\n"
                 "- Chinese inside a translated proper-name parenthetical, e.g. Shanghai Example Technology Co., Ltd. (上海示例科技有限公司).\n"
                 "- Original placeholders inside 【】 or blank placeholders.\n"
                 "- Chinese trademark/brand marks intentionally retained with English context.\n\n"
+                f"COMPANY/INSTITUTION NAME GLOSSARY:\n{company_glossary}\n\n"
                 f"CAPITAL MARKETS LEGAL RAG:\n{legal_rag_for_text(rag_text)}\n\n"
                 f"BLOCKS JSON:\n{json.dumps({'blocks': payload}, ensure_ascii=False)}"
             ),
@@ -968,13 +1156,14 @@ def final_llm_audit_batch(
     ]
     data = chat_json(client, provider, model, messages, retries=2)
     batch_ids = {int(block["id"]) for block in batch}
-    issues = []
+    issues = deterministic_company_name_audit_issues(batch, translations, company_entries)
+    issue_ids = {int(issue["id"]) for issue in issues}
     for item in data.get("issues", []) or []:
         try:
             block_id = int(item.get("id"))
         except (TypeError, ValueError):
             continue
-        if block_id in batch_ids:
+        if block_id in batch_ids and block_id not in issue_ids:
             issues.append(
                 {
                     "id": block_id,
@@ -982,6 +1171,7 @@ def final_llm_audit_batch(
                     "chinese_fragment": str(item.get("chinese_fragment", "")).strip(),
                 }
             )
+            issue_ids.add(block_id)
     return issues
 
 
@@ -995,20 +1185,22 @@ def final_llm_audit_and_repair_translations(
     log,
     progress,
     font_instruction: str,
+    company_entries: list[dict],
+    company_glossary: str,
     max_rounds: int = 2,
 ) -> set[int]:
     repaired_ids: set[int] = set()
     block_by_id = {int(block["id"]): block for block in blocks}
     total = len(blocks)
     for round_index in range(1, max_rounds + 1):
-        progress(total, total, f"v1.7 final LLM audit round {round_index}")
+        progress(total, total, f"{APP_VERSION} final LLM audit round {round_index}")
         issues = []
         for batch_index, batch in enumerate(build_final_audit_batches(blocks, translations), start=1):
-            progress(total, total, f"v1.7 final LLM audit {batch_index}")
+            progress(total, total, f"{APP_VERSION} final LLM audit {batch_index}")
             try:
-                issues.extend(final_llm_audit_batch(client, provider, model, batch, translations))
+                issues.extend(final_llm_audit_batch(client, provider, model, batch, translations, company_entries, company_glossary))
             except Exception as exc:
-                log(f"v1.7 final LLM audit batch failed and was skipped: {exc}")
+                log(f"{APP_VERSION} final LLM audit batch failed and was skipped: {exc}")
         if not issues:
             log(f"{APP_VERSION} final LLM audit passed: no untranslated Chinese/CJK legal content found.")
             return repaired_ids
@@ -1031,11 +1223,11 @@ def final_llm_audit_and_repair_translations(
 
         changed = False
         for batch_index, batch in enumerate(build_repair_batches(bad_blocks), start=1):
-            progress(total, total, f"v1.7 final LLM repair {round_index}-{batch_index}")
+            progress(total, total, f"{APP_VERSION} final LLM repair {round_index}-{batch_index}")
             try:
-                repaired = repair_translation_batch(client, provider, model, memory, batch, font_instruction)
+                repaired = repair_translation_batch(client, provider, model, memory, batch, font_instruction, company_glossary)
             except Exception as exc:
-                log(f"v1.7 final LLM repair batch failed, trying single blocks. Reason: {exc}")
+                log(f"{APP_VERSION} final LLM repair batch failed, trying single blocks. Reason: {exc}")
                 repaired = {}
             for block_id, translation in repaired.items():
                 block = block_by_id.get(block_id)
@@ -1051,9 +1243,9 @@ def final_llm_audit_and_repair_translations(
                 if block_id in repaired_ids and not needs_translation_repair(block["text"], translations.get(block_id, "")):
                     continue
                 try:
-                    single = repair_translation_batch(client, provider, model, memory, [block], font_instruction)
+                    single = repair_translation_batch(client, provider, model, memory, [block], font_instruction, company_glossary)
                 except Exception as exc:
-                    log(f"v1.7 final LLM single repair failed for block {block_id}: {exc}")
+                    log(f"{APP_VERSION} final LLM single repair failed for block {block_id}: {exc}")
                     continue
                 translation = normalize_translation_against_source(block["text"], single.get(block_id, ""))
                 if translation and translation != translations.get(block_id, ""):
@@ -1419,7 +1611,9 @@ def translate_docx_hybrid(
 
     source_markdown = "\n\n".join(block["markdown"] for block in blocks)
     client = build_client(api_key, base_url)
-    memory = make_translation_memory(client, provider, model, source_markdown, log, font_instruction)
+    company_entries = make_company_name_glossary(client, provider, model, source_markdown, log)
+    company_glossary = company_glossary_to_prompt(company_entries)
+    memory = make_translation_memory(client, provider, model, source_markdown, log, font_instruction, company_glossary)
     chunks = build_chunks(blocks)
     log(f"{APP_VERSION} 复合方法：{len(blocks)} 个中文 block，分为 {len(chunks)} 个 Markdown 大段批次。")
     log(f"字体设置：英文 {english_font}；数字 {DIGIT_FONT}；中文 {chinese_font}。")
@@ -1441,7 +1635,7 @@ def translate_docx_hybrid(
         after_start = blocks.index(chunk[-1]) + 1
         after = "\n\n".join(block["markdown"] for block in blocks[after_start : min(len(blocks), after_start + 3)])
         progress(completed, len(blocks), f"翻译 Markdown 大段 {chunk_index}/{len(chunks)}")
-        translated_markdown = translate_markdown_chunk(client, provider, model, memory, chunk_markdown, before, after, font_instruction)
+        translated_markdown = translate_markdown_chunk(client, provider, model, memory, chunk_markdown, before, after, font_instruction, company_glossary)
         translated_markdown_parts.append(translated_markdown)
         chunk_translations = parse_translated_markdown(translated_markdown)
         for block in chunk:
@@ -1459,11 +1653,21 @@ def translate_docx_hybrid(
 
     if not cancelled:
         auto_repaired_blocks.update(
-            repair_all_translations(client, provider, model, memory, blocks, translated_blocks, log, progress, font_instruction)
+            repair_all_translations(client, provider, model, memory, blocks, translated_blocks, log, progress, font_instruction, company_glossary)
         )
         final_audit_repaired_blocks.update(
             final_llm_audit_and_repair_translations(
-                client, provider, model, memory, blocks, translated_blocks, log, progress, font_instruction
+                client,
+                provider,
+                model,
+                memory,
+                blocks,
+                translated_blocks,
+                log,
+                progress,
+                font_instruction,
+                company_entries,
+                company_glossary,
             )
         )
     all_mappings = []
@@ -1518,7 +1722,7 @@ def translate_docx_hybrid(
                     "style": "",
                     "target_text": "",
                     "confidence": "llm-audit",
-                    "note": "v1.7 final LLM audit found untranslated Chinese/CJK content and repaired this block before export.",
+                    "note": f"{APP_VERSION} final LLM audit found untranslated Chinese/CJK content or a glossary name-format issue and repaired this block before export.",
                 }
             )
         for public_span in block["format_spans"]:
@@ -1603,7 +1807,17 @@ def translate_docx_hybrid(
     translated_md_path.write_text(build_translated_blocks_markdown(blocks, translated_blocks), encoding="utf-8")
     checklist_path.write_text(checklist_markdown(checklist), encoding="utf-8")
     json_path.write_text(
-        json.dumps({"cancelled": cancelled, "blocks": blocks, "mappings": all_mappings, "checklist": checklist}, ensure_ascii=False, indent=2),
+        json.dumps(
+            {
+                "cancelled": cancelled,
+                "company_glossary": company_entries,
+                "blocks": blocks,
+                "mappings": all_mappings,
+                "checklist": checklist,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
         encoding="utf-8",
     )
     progress(completed if cancelled else len(blocks), len(blocks), "已中止并导出当前进度" if cancelled else "全部完成")
