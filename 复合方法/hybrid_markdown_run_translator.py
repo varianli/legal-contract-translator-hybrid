@@ -34,6 +34,7 @@ PROVIDER_DEFAULTS = {
     "OpenAI": {"base_url": "", "model": "gpt-4.1", "key_label": "OpenAI API Key"},
     "DeepSeek": {"base_url": "https://api.deepseek.com", "model": "deepseek-v4-flash", "key_label": "DeepSeek API Key"},
 }
+APP_VERSION = "v1.4"
 
 SYSTEM_PROMPT = """You are a senior bilingual legal translator and document-format alignment specialist.
 Translate Chinese legal contracts into precise formal legal English.
@@ -763,6 +764,81 @@ def repair_chunk_translations(
     return repaired_ids
 
 
+def repair_all_translations(
+    client: OpenAI,
+    provider: str,
+    model: str,
+    memory: str,
+    blocks: list[dict],
+    translations: dict[int, str],
+    log,
+    progress,
+    max_rounds: int = 5,
+) -> set[int]:
+    repaired_ids: set[int] = set()
+    block_by_id = {int(block["id"]): block for block in blocks}
+    total = len(blocks)
+    for round_index in range(1, max_rounds + 1):
+        bad_blocks = [
+            block
+            for block in blocks
+            if needs_translation_repair(block["text"], translations.get(int(block["id"]), ""))
+        ]
+        if not bad_blocks:
+            log(f"{APP_VERSION} 全文自检查通过：没有发现明显漏翻或大段中文残留。")
+            return repaired_ids
+
+        ids = ", ".join(str(block["id"]) for block in bad_blocks[:20])
+        more = "..." if len(bad_blocks) > 20 else ""
+        log(f"{APP_VERSION} 全文自检查第 {round_index} 轮：发现 {len(bad_blocks)} 个 block 需要修复：{ids}{more}")
+        changed = False
+        batches = build_repair_batches(bad_blocks)
+        for batch_index, batch in enumerate(batches, start=1):
+            progress(total - len(bad_blocks), total, f"全文自修复第 {round_index} 轮 {batch_index}/{len(batches)}")
+            try:
+                repaired = repair_translation_batch(client, provider, model, memory, batch)
+            except Exception as exc:
+                log(f"批量自修复失败，改为逐段修复。原因：{exc}")
+                repaired = {}
+            for block_id, translation in repaired.items():
+                block = block_by_id.get(block_id)
+                if not block:
+                    continue
+                translation = normalize_translation_against_source(block["text"], translation)
+                if translation and translation != translations.get(block_id, ""):
+                    translations[block_id] = translation
+                    repaired_ids.add(block_id)
+                    changed = True
+
+            for block in batch:
+                block_id = int(block["id"])
+                if not needs_translation_repair(block["text"], translations.get(block_id, "")):
+                    continue
+                try:
+                    single = repair_translation_batch(client, provider, model, memory, [block])
+                except Exception as exc:
+                    log(f"block {block_id} 单段自修复失败：{exc}")
+                    continue
+                translation = normalize_translation_against_source(block["text"], single.get(block_id, ""))
+                if translation and translation != translations.get(block_id, ""):
+                    translations[block_id] = translation
+                    repaired_ids.add(block_id)
+                    changed = True
+
+        if not changed:
+            remaining = [
+                str(block["id"])
+                for block in blocks
+                if needs_translation_repair(block["text"], translations.get(int(block["id"]), ""))
+            ]
+            log(
+                f"{APP_VERSION} 全文自修复本轮没有取得新结果；将继续导出，并在 checklist 标出剩余疑似问题 block："
+                f"{', '.join(remaining[:20])}{'...' if len(remaining) > 20 else ''}"
+            )
+            break
+    return repaired_ids
+
+
 def map_format_spans(client: OpenAI, provider: str, model: str, memory: str, source_blocks: list[dict], translated_blocks: dict[int, str]) -> list[dict]:
     payload = []
     for block in source_blocks:
@@ -1039,7 +1115,7 @@ def translate_docx_hybrid(
     client = build_client(api_key, base_url)
     memory = make_translation_memory(client, provider, model, source_markdown, log)
     chunks = build_chunks(blocks)
-    log(f"复合方法：{len(blocks)} 个中文 block，分为 {len(chunks)} 个 Markdown 大段批次。")
+    log(f"{APP_VERSION} 复合方法：{len(blocks)} 个中文 block，分为 {len(chunks)} 个 Markdown 大段批次。")
 
     translated_blocks: dict[int, str] = {}
     translated_markdown_parts = []
@@ -1064,39 +1140,7 @@ def translate_docx_hybrid(
             block_id = int(block["id"])
             if block_id in chunk_translations:
                 chunk_translations[block_id] = normalize_translation_against_source(block["text"], chunk_translations[block_id])
-        if not (cancel_event and cancel_event.is_set()):
-            auto_repaired_blocks.update(
-                repair_chunk_translations(
-                    client,
-                    provider,
-                    model,
-                    memory,
-                    chunk,
-                    chunk_translations,
-                    log,
-                    progress,
-                    completed,
-                    len(blocks),
-                )
-            )
-            still_missing = [str(block["id"]) for block in chunk if not chunk_translations.get(int(block["id"]), "").strip()]
-            if still_missing:
-                raise RuntimeError(
-                    "自检查自修复后仍有 block 没有译文，已停止导出，避免生成含中文的文件。"
-                    f" 未完成 block: {', '.join(still_missing[:20])}{'...' if len(still_missing) > 20 else ''}"
-                )
-            still_bad = [
-                str(block["id"])
-                for block in chunk
-                if needs_translation_repair(block["text"], chunk_translations.get(int(block["id"]), ""))
-            ]
-            if still_bad:
-                raise RuntimeError(
-                    "自检查自修复后仍有 block 疑似中文残留，已停止导出，避免生成含中文的文件。"
-                    f" 疑似问题 block: {', '.join(still_bad[:20])}{'...' if len(still_bad) > 20 else ''}"
-                )
         translated_blocks.update(chunk_translations)
-        all_mappings.extend(map_format_spans(client, provider, model, memory, chunk, chunk_translations))
         completed += len(chunk)
         if cancel_event and cancel_event.is_set():
             cancelled = True
@@ -1104,6 +1148,19 @@ def translate_docx_hybrid(
             progress(completed, len(blocks), "已中止，正在导出当前进度")
             break
         progress(completed, len(blocks), f"大段 {chunk_index}/{len(chunks)} 已完成")
+
+    if not cancelled:
+        auto_repaired_blocks.update(
+            repair_all_translations(client, provider, model, memory, blocks, translated_blocks, log, progress)
+        )
+    all_mappings = []
+    for chunk_index, chunk in enumerate(chunks, start=1):
+        ready_chunk = [block for block in chunk if translated_blocks.get(int(block["id"]), "").strip()]
+        if not ready_chunk:
+            continue
+        progress(len(blocks), len(blocks), f"映射格式 {chunk_index}/{len(chunks)}")
+        chunk_translations = {int(block["id"]): translated_blocks.get(int(block["id"]), "") for block in ready_chunk}
+        all_mappings.extend(map_format_spans(client, provider, model, memory, ready_chunk, chunk_translations))
 
     mappings_by_span = {str(mapping.get("span_id")): mapping for mapping in all_mappings if mapping.get("span_id")}
     checklist = []
@@ -1300,7 +1357,7 @@ class HybridApp:
 
         self.log_box = Text(root, height=14, wrap="word")
         self.log_box.pack(fill=BOTH, expand=True, padx=16, pady=(4, 16))
-        self.log("复合方法：Markdown 负责结构和上下文，run 结构负责格式抽取，模型负责格式片段到英文短语的映射。")
+        self.log(f"{APP_VERSION} 复合方法：Markdown 负责结构和上下文，run 结构负责格式抽取，模型负责格式片段到英文短语的映射。")
 
     def on_provider_change(self, provider):
         defaults = PROVIDER_DEFAULTS[provider]

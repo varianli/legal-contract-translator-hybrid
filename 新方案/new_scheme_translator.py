@@ -34,6 +34,7 @@ PROVIDER_DEFAULTS = {
     "OpenAI": {"base_url": "", "model": "gpt-4.1", "key_label": "OpenAI API Key"},
     "DeepSeek": {"base_url": "https://api.deepseek.com", "model": "deepseek-v4-flash", "key_label": "DeepSeek API Key"},
 }
+APP_VERSION = "v1.4"
 
 SYSTEM_PROMPT = """You are a senior bilingual legal translator and legal formatting alignment specialist.
 Translate Chinese legal contracts into precise, formal legal English.
@@ -656,6 +657,76 @@ def repair_chunk_results(
     return repaired_ids
 
 
+def repair_all_results(
+    client: OpenAI,
+    provider: str,
+    model: str,
+    memory: str,
+    items: list[dict],
+    results: dict[int, dict],
+    texts: list[str],
+    log,
+    progress,
+    max_rounds: int = 5,
+) -> set[int]:
+    repaired_ids: set[int] = set()
+    total = len(items)
+    for round_index in range(1, max_rounds + 1):
+        bad_items = []
+        for item in items:
+            item_id = int(item["id"])
+            result = results.get(item_id)
+            translation = "" if not result else str(result.get("translation", "")).strip()
+            if needs_translation_repair(item["text"], translation):
+                bad_items.append(item)
+        if not bad_items:
+            log(f"{APP_VERSION} 全文自检查通过：没有发现明显漏翻或大段中文残留。")
+            return repaired_ids
+
+        ids = ", ".join(str(int(item["id"]) + 1) for item in bad_items[:20])
+        more = "..." if len(bad_items) > 20 else ""
+        log(f"{APP_VERSION} 全文自检查第 {round_index} 轮：发现 {len(bad_items)} 个段落需要修复：{ids}{more}")
+        changed = False
+        for index, item in enumerate(bad_items, start=1):
+            item_id = int(item["id"])
+            progress(total - len(bad_items) + index - 1, total, f"全文自修复第 {round_index} 轮 {index}/{len(bad_items)}")
+            context_before = "\n".join(texts[max(0, item_id - 5) : item_id])
+            context_after = "\n".join(texts[item_id + 1 : min(len(texts), item_id + 6)])
+            try:
+                data = translate_single_item(client, provider, model, memory, item, context_before, context_after)
+            except Exception as exc:
+                log(f"段落 {item_id + 1} 自修复重翻失败：{exc}")
+                continue
+            for paragraph_result in data.get("paragraphs", []) or []:
+                try:
+                    paragraph_id = int(paragraph_result.get("id"))
+                except (TypeError, ValueError):
+                    continue
+                if paragraph_id != item_id:
+                    continue
+                translation = normalize_translation_against_source(item["text"], str(paragraph_result.get("translation", "")).strip())
+                paragraph_result["translation"] = translation
+                if translation and translation != str(results.get(item_id, {}).get("translation", "")).strip():
+                    results[item_id] = paragraph_result
+                    repaired_ids.add(item_id)
+                    changed = True
+                break
+        if not changed:
+            remaining = [
+                str(int(item["id"]) + 1)
+                for item in items
+                if needs_translation_repair(
+                    item["text"], str(results.get(int(item["id"]), {}).get("translation", "")).strip()
+                )
+            ]
+            log(
+                f"{APP_VERSION} 全文自修复本轮没有取得新结果；将继续导出，并在 checklist 标出剩余疑似问题段落："
+                f"{', '.join(remaining[:20])}{'...' if len(remaining) > 20 else ''}"
+            )
+            break
+    return repaired_ids
+
+
 def normalize_spaces(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
@@ -888,7 +959,7 @@ def translate_docx_new_scheme(
         items.append({"id": idx, "text": texts[idx], "format_spans": public_spans})
 
     chunks = build_chunks(items)
-    log(f"发现 {len(targets)} 个含中文段落，分为 {len(chunks)} 个大段翻译批次。")
+    log(f"{APP_VERSION} 发现 {len(targets)} 个含中文段落，分为 {len(chunks)} 个大段翻译批次。")
 
     all_results = {}
     auto_repaired_paragraphs: set[int] = set()
@@ -915,32 +986,17 @@ def translate_docx_new_scheme(
                 data["paragraphs"].extend(single.get("paragraphs", []))
         for paragraph_result in data.get("paragraphs", []):
             all_results[int(paragraph_result.get("id"))] = paragraph_result
-        if not (cancel_event and cancel_event.is_set()):
-            auto_repaired_paragraphs.update(
-                repair_chunk_results(client, provider, model, memory, chunk, all_results, context_before, context_after, log)
-            )
-            still_missing = [str(int(item["id"]) + 1) for item in chunk if not all_results.get(int(item["id"]), {}).get("translation", "").strip()]
-            if still_missing:
-                raise RuntimeError(
-                    "自检查自修复后仍有段落没有译文，已停止导出，避免生成含中文的文件。"
-                    f" 未完成段落: {', '.join(still_missing[:20])}{'...' if len(still_missing) > 20 else ''}"
-                )
-            still_bad = [
-                str(int(item["id"]) + 1)
-                for item in chunk
-                if needs_translation_repair(item["text"], str(all_results.get(int(item["id"]), {}).get("translation", "")).strip())
-            ]
-            if still_bad:
-                raise RuntimeError(
-                    "自检查自修复后仍有段落疑似中文残留，已停止导出，避免生成含中文的文件。"
-                    f" 疑似问题段落: {', '.join(still_bad[:20])}{'...' if len(still_bad) > 20 else ''}"
-                )
         completed += len(chunk)
         progress(completed, len(targets), f"第 {chunk_number}/{len(chunks)} 个大段已返回。")
         if cancel_event and cancel_event.is_set():
             cancelled = True
             log("当前批次已完成；根据中止请求，开始导出当前进度。")
             break
+
+    if not cancelled:
+        auto_repaired_paragraphs.update(
+            repair_all_results(client, provider, model, memory, items, all_results, texts, log, progress)
+        )
 
     checklist_rows = []
     if cancelled:
@@ -1166,7 +1222,7 @@ class NewSchemeApp:
 
         self.log_box = Text(root, height=14, wrap="word")
         self.log_box.pack(fill=BOTH, expand=True, padx=16, pady=(4, 16))
-        self.log("新方案：大段上下文翻译 -> 大模型格式映射 -> checklist 防错漏。")
+        self.log(f"{APP_VERSION} 新方案：大段上下文翻译 -> 大模型格式映射 -> checklist 防错漏。")
         self.log("注意：该方案会重建段落内 run，以便把原文粗体/下划线/高亮映射到英文对应短语。")
 
     def on_provider_change(self, provider):
