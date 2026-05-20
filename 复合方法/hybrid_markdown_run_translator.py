@@ -34,7 +34,7 @@ PROVIDER_DEFAULTS = {
     "OpenAI": {"base_url": "", "model": "gpt-4.1", "key_label": "OpenAI API Key"},
     "DeepSeek": {"base_url": "https://api.deepseek.com", "model": "deepseek-v4-flash", "key_label": "DeepSeek API Key"},
 }
-APP_VERSION = "v1.6"
+APP_VERSION = "v1.7"
 ENGLISH_FONT_OPTIONS = ("Times New Roman", "Calibri")
 CHINESE_FONT_OPTIONS = ("楷体_GB2312", "宋体")
 DEFAULT_ENGLISH_FONT = "Times New Roman"
@@ -45,6 +45,12 @@ SYSTEM_PROMPT = """You are a senior bilingual legal translator and document-form
 Translate Chinese legal contracts into precise formal legal English.
 Preserve legal meaning, defined terms, numbering, dates, parties, amounts, placeholders, and clause references.
 Return only valid JSON when JSON is requested."""
+
+FINAL_AUDIT_SYSTEM_PROMPT = """You are a senior legal translation QA reviewer.
+Your task is to quickly audit completed English translations of Chinese capital-markets legal documents and identify only blocks that still contain untranslated Chinese/CJK legal content.
+Flag a block when Chinese/CJK characters remain as substantive legal prose, clause headings, table labels, sentence fragments, mixed Chinese-English leftovers, or Chinese-only company/person names that should be rendered as English Name (Chinese Name).
+Do not flag Chinese/CJK characters that are intentionally retained as part of an already translated proper-name format such as English Name (Chinese Name), original placeholders inside 【】, trademark/brand marks with English context, or source-required bracket blanks.
+Return only valid JSON."""
 
 CAPITAL_MARKETS_LEGAL_RAG = """Capital markets legal English retrieval notes:
 - This is a capital markets / private equity style legal contract. Prefer formal transactional drafting, not conversational English.
@@ -899,6 +905,167 @@ def repair_all_translations(
     return repaired_ids
 
 
+def build_final_audit_batches(blocks: list[dict], translations: dict[int, str], max_chars: int = 50000, max_blocks: int = 80) -> list[list[dict]]:
+    batches = []
+    current = []
+    current_chars = 0
+    for block in blocks:
+        block_id = int(block["id"])
+        size = len(block.get("text", "")) + len(translations.get(block_id, "")) + 300
+        if current and (current_chars + size > max_chars or len(current) >= max_blocks):
+            batches.append(current)
+            current = []
+            current_chars = 0
+        current.append(block)
+        current_chars += size
+    if current:
+        batches.append(current)
+    return batches
+
+
+def final_llm_audit_batch(
+    client: OpenAI,
+    provider: str,
+    model: str,
+    batch: list[dict],
+    translations: dict[int, str],
+) -> list[dict]:
+    payload = []
+    rag_text_parts = []
+    for block in batch:
+        block_id = int(block["id"])
+        source_text = block.get("text", "")
+        translation = translations.get(block_id, "")
+        payload.append(
+            {
+                "id": block_id,
+                "source_text": compact_text(source_text, 1600),
+                "translation": compact_text(translation, 2600),
+            }
+        )
+        rag_text_parts.append(source_text)
+    rag_text = "\n".join(rag_text_parts)
+    messages = [
+        {"role": "system", "content": FINAL_AUDIT_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                "Quickly audit these completed English translation blocks.\n"
+                "Return JSON exactly like {\"issues\":[{\"id\":123,\"reason\":\"...\",\"chinese_fragment\":\"...\"}]}.\n"
+                "Return an empty issues array if all blocks pass.\n\n"
+                "What to flag:\n"
+                "- Untranslated Chinese legal prose, headings, labels, table cells, or sentence fragments.\n"
+                "- Chinese text appended to an otherwise English translation.\n"
+                "- Chinese-only company/person names when they are not paired with an English rendition in English Name (Chinese Name) form.\n\n"
+                "What not to flag:\n"
+                "- Chinese inside a translated proper-name parenthetical, e.g. Shanghai Example Technology Co., Ltd. (上海示例科技有限公司).\n"
+                "- Original placeholders inside 【】 or blank placeholders.\n"
+                "- Chinese trademark/brand marks intentionally retained with English context.\n\n"
+                f"CAPITAL MARKETS LEGAL RAG:\n{legal_rag_for_text(rag_text)}\n\n"
+                f"BLOCKS JSON:\n{json.dumps({'blocks': payload}, ensure_ascii=False)}"
+            ),
+        },
+    ]
+    data = chat_json(client, provider, model, messages, retries=2)
+    batch_ids = {int(block["id"]) for block in batch}
+    issues = []
+    for item in data.get("issues", []) or []:
+        try:
+            block_id = int(item.get("id"))
+        except (TypeError, ValueError):
+            continue
+        if block_id in batch_ids:
+            issues.append(
+                {
+                    "id": block_id,
+                    "reason": str(item.get("reason", "")).strip(),
+                    "chinese_fragment": str(item.get("chinese_fragment", "")).strip(),
+                }
+            )
+    return issues
+
+
+def final_llm_audit_and_repair_translations(
+    client: OpenAI,
+    provider: str,
+    model: str,
+    memory: str,
+    blocks: list[dict],
+    translations: dict[int, str],
+    log,
+    progress,
+    font_instruction: str,
+    max_rounds: int = 2,
+) -> set[int]:
+    repaired_ids: set[int] = set()
+    block_by_id = {int(block["id"]): block for block in blocks}
+    total = len(blocks)
+    for round_index in range(1, max_rounds + 1):
+        progress(total, total, f"v1.7 final LLM audit round {round_index}")
+        issues = []
+        for batch_index, batch in enumerate(build_final_audit_batches(blocks, translations), start=1):
+            progress(total, total, f"v1.7 final LLM audit {batch_index}")
+            try:
+                issues.extend(final_llm_audit_batch(client, provider, model, batch, translations))
+            except Exception as exc:
+                log(f"v1.7 final LLM audit batch failed and was skipped: {exc}")
+        if not issues:
+            log(f"{APP_VERSION} final LLM audit passed: no untranslated Chinese/CJK legal content found.")
+            return repaired_ids
+
+        seen = set()
+        bad_blocks = []
+        notes = []
+        for issue in issues:
+            block_id = int(issue["id"])
+            if block_id in seen or block_id not in block_by_id:
+                continue
+            seen.add(block_id)
+            bad_blocks.append(block_by_id[block_id])
+            fragment = issue.get("chinese_fragment") or issue.get("reason") or ""
+            notes.append(f"{block_id}: {compact_text(fragment, 80)}")
+        log(
+            f"{APP_VERSION} final LLM audit round {round_index}: found {len(bad_blocks)} blocks needing repair: "
+            f"{', '.join(notes[:12])}{'...' if len(notes) > 12 else ''}"
+        )
+
+        changed = False
+        for batch_index, batch in enumerate(build_repair_batches(bad_blocks), start=1):
+            progress(total, total, f"v1.7 final LLM repair {round_index}-{batch_index}")
+            try:
+                repaired = repair_translation_batch(client, provider, model, memory, batch, font_instruction)
+            except Exception as exc:
+                log(f"v1.7 final LLM repair batch failed, trying single blocks. Reason: {exc}")
+                repaired = {}
+            for block_id, translation in repaired.items():
+                block = block_by_id.get(block_id)
+                if not block:
+                    continue
+                translation = normalize_translation_against_source(block["text"], translation)
+                if translation and translation != translations.get(block_id, ""):
+                    translations[block_id] = translation
+                    repaired_ids.add(block_id)
+                    changed = True
+            for block in batch:
+                block_id = int(block["id"])
+                if block_id in repaired_ids and not needs_translation_repair(block["text"], translations.get(block_id, "")):
+                    continue
+                try:
+                    single = repair_translation_batch(client, provider, model, memory, [block], font_instruction)
+                except Exception as exc:
+                    log(f"v1.7 final LLM single repair failed for block {block_id}: {exc}")
+                    continue
+                translation = normalize_translation_against_source(block["text"], single.get(block_id, ""))
+                if translation and translation != translations.get(block_id, ""):
+                    translations[block_id] = translation
+                    repaired_ids.add(block_id)
+                    changed = True
+        if not changed:
+            log(f"{APP_VERSION} final LLM audit found issues but repair produced no new translations; exporting with checklist notes.")
+            break
+    return repaired_ids
+
+
 def map_format_spans(
     client: OpenAI,
     provider: str,
@@ -1261,6 +1428,7 @@ def translate_docx_hybrid(
     translated_markdown_parts = []
     all_mappings = []
     auto_repaired_blocks: set[int] = set()
+    final_audit_repaired_blocks: set[int] = set()
     completed = 0
     cancelled = False
     for chunk_index, chunk in enumerate(chunks, start=1):
@@ -1292,6 +1460,11 @@ def translate_docx_hybrid(
     if not cancelled:
         auto_repaired_blocks.update(
             repair_all_translations(client, provider, model, memory, blocks, translated_blocks, log, progress, font_instruction)
+        )
+        final_audit_repaired_blocks.update(
+            final_llm_audit_and_repair_translations(
+                client, provider, model, memory, blocks, translated_blocks, log, progress, font_instruction
+            )
         )
     all_mappings = []
     for chunk_index, chunk in enumerate(chunks, start=1):
@@ -1334,6 +1507,18 @@ def translate_docx_hybrid(
                     "target_text": "",
                     "confidence": "deterministic",
                     "note": "自检查发现漏翻或中文残留后，已在导出前自动重翻该 block。",
+                }
+            )
+        if block_id in final_audit_repaired_blocks:
+            checklist.append(
+                {
+                    "status": "FINAL_LLM_AUDIT_REPAIRED",
+                    "block_id": block_id,
+                    "source_text": "",
+                    "style": "",
+                    "target_text": "",
+                    "confidence": "llm-audit",
+                    "note": "v1.7 final LLM audit found untranslated Chinese/CJK content and repaired this block before export.",
                 }
             )
         for public_span in block["format_spans"]:
