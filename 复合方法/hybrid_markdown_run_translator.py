@@ -49,8 +49,9 @@ CAPITAL_MARKETS_LEGAL_RAG = """Capital markets legal English retrieval notes:
 - Translate \u4ea4\u5272 as Closing, \u4ea4\u5272\u65e5 as Closing Date, \u6700\u8fdf\u5b8c\u6210\u65e5 as Longstop Date, \u7b7e\u7f72\u65e5 as Signing Date.
 - Translate \u672c\u6b21\u4ea4\u6613 as this Transaction, \u6295\u8d44\u6b3e as Investment Amount, \u76ee\u6807\u516c\u53f8 as Target Company, \u96c6\u56e2\u516c\u53f8 as Group Company / Group Companies.
 - For RMB amounts expressed as \u4eba\u6c11\u5e01X\u4e07\u5143, convert to yuan in English: \u4eba\u6c11\u5e0112.7764\u4e07\u5143 -> RMB 127,764. Do not output Ten Thousand Yuan or million for \u4e07\u5143.
+- Preserve source \u3010...\u3011 bracket placeholders exactly. \u3010\u3011 stays \u3010\u3011, not [] or underscores; \u3010number\u3011 stays in \u3010number\u3011 form after translation/conversion.
 - Preserve defined-term capitalization once established. If the same Chinese term recurs, reuse the same English term.
-- Use English punctuation in English output: straight quotes, half-width commas, periods, semicolons, colons, parentheses, and brackets."""
+- Use English punctuation in English output: straight quotes, half-width commas, periods, semicolons, colons, and parentheses, while preserving source \u3010...\u3011 placeholders."""
 
 LEGAL_RAG_TERMS = [
     ("\u9644\u5f55", "\u9644\u5f55 = Appendix; use Roman numerals, e.g. Appendix I, Appendix II, Appendix III(A)."),
@@ -105,8 +106,6 @@ CJK_PUNCT_TRANSLATION = str.maketrans(
         "\u2018": "'",
         "\u2019": "'",
         "\u3001": ",",
-        "\u3010": "[",
-        "\u3011": "]",
         "\u300a": '"',
         "\u300b": '"',
     }
@@ -168,6 +167,22 @@ def normalize_english_punctuation(text: str) -> str:
 
 
 FULL_RMB_WANYUAN_RE = re.compile(r"^\s*\u4eba\u6c11\u5e01\s*([\u3010\[])?\s*([0-9][0-9,，]*(?:\.\d+)?)\s*([\u3011\]])?\s*\u4e07\u5143\s*$")
+FULL_CHINESE_DATE_RE = re.compile(r"^\s*(\d{4})\s*\u5e74\s*(\d{1,2}|\u3010\u3011|_+)\s*\u6708\s*(\d{1,2}|\u3010\u3011|_+)\s*\u65e5\s*$")
+SOURCE_BRACKET_RE = re.compile(r"\u3010([^\u3011]*)\u3011")
+MONTH_NAMES = {
+    1: "January",
+    2: "February",
+    3: "March",
+    4: "April",
+    5: "May",
+    6: "June",
+    7: "July",
+    8: "August",
+    9: "September",
+    10: "October",
+    11: "November",
+    12: "December",
+}
 
 
 def format_rmb_yuan_from_wanyuan(number_text: str) -> str | None:
@@ -187,15 +202,54 @@ def deterministic_amount_translation(source_text: str) -> str | None:
     if not amount:
         return None
     if match.group(1) or match.group(3):
-        return f"RMB [{amount}]"
+        return f"RMB \u3010{amount}\u3011"
     return f"RMB {amount}"
+
+
+def date_token_to_english(token: str, is_month: bool) -> str:
+    token = (token or "").strip()
+    if token == "\u3010\u3011" or re.fullmatch(r"_+", token):
+        return token
+    if not token.isdigit():
+        return token
+    value = int(token)
+    if is_month and value in MONTH_NAMES:
+        return MONTH_NAMES[value]
+    return str(value)
+
+
+def deterministic_date_translation(source_text: str) -> str | None:
+    match = FULL_CHINESE_DATE_RE.fullmatch(source_text or "")
+    if not match:
+        return None
+    year, month_token, day_token = match.groups()
+    month = date_token_to_english(month_token, True)
+    day = date_token_to_english(day_token, False)
+    return f"{month} {day}, {year}"
+
+
+def preserve_source_bracket_tokens(source_text: str, translation: str) -> str:
+    result = translation or ""
+    for content in SOURCE_BRACKET_RE.findall(source_text or ""):
+        target = f"\u3010{content}\u3011"
+        if target in result:
+            continue
+        if content:
+            result = re.sub(r"\[\s*" + re.escape(content) + r"\s*\]", target, result, count=1)
+        else:
+            result = re.sub(r"\[\s*\]", target, result, count=1)
+            result = re.sub(r"_+", target, result, count=1)
+    return result
 
 
 def normalize_translation_against_source(source_text: str, translation: str) -> str:
     deterministic = deterministic_amount_translation(source_text)
     if deterministic:
         return deterministic
-    return normalize_legal_english(translation)
+    deterministic = deterministic_date_translation(source_text)
+    if deterministic:
+        return deterministic
+    return preserve_source_bracket_tokens(source_text, normalize_legal_english(translation))
 
 
 def normalize_roman_token(token: str) -> str:
