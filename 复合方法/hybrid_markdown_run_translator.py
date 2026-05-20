@@ -34,7 +34,7 @@ PROVIDER_DEFAULTS = {
     "OpenAI": {"base_url": "", "model": "gpt-4.1", "key_label": "OpenAI API Key"},
     "DeepSeek": {"base_url": "https://api.deepseek.com", "model": "deepseek-v4-flash", "key_label": "DeepSeek API Key"},
 }
-APP_VERSION = "v1.10"
+APP_VERSION = "v1.11"
 ENGLISH_FONT_OPTIONS = ("Times New Roman", "Calibri")
 CHINESE_FONT_OPTIONS = ("楷体_GB2312", "宋体")
 DEFAULT_ENGLISH_FONT = "Times New Roman"
@@ -1654,6 +1654,19 @@ def safe_save_document(doc: Document, output_path: Path) -> Path:
         return fallback
 
 
+def write_process_files_note(process_dir: Path) -> Path:
+    note_path = process_dir / "说明_这些过程文件可删除.txt"
+    note_path.write_text(
+        (
+            "这里保存的是翻译过程文件，用于排查问题或回看模型处理记录。\n\n"
+            "最终交付给客户/同事通常只需要外层输出目录里的 Word 文件：*_复合方法英文翻译.docx。\n"
+            "如果译文 Word 已经确认没有问题，本文件夹里的 .md、.json 和本说明文件都可以删除。\n"
+        ),
+        encoding="utf-8",
+    )
+    return note_path
+
+
 def checklist_markdown(rows: list[dict]) -> str:
     lines = [
         "# 复合方法 Checklist",
@@ -1944,19 +1957,23 @@ def translate_docx_hybrid(
 
     base = input_path.stem
     suffix = "_已中止" if cancelled else ""
+    process_dir = output_dir / "过程文件"
+    process_dir.mkdir(parents=True, exist_ok=True)
     docx_path = safe_save_document(doc, output_dir / f"{base}_复合方法英文翻译.docx")
-    source_md_path = output_dir / f"{base}_source_blocks.md"
-    translated_md_path = output_dir / f"{base}_translated_blocks.md"
-    checklist_path = output_dir / f"{base}_复合方法checklist.md"
-    json_path = output_dir / f"{base}_复合方法明细.json"
+    source_md_path = process_dir / f"{base}_source_blocks.md"
+    translated_md_path = process_dir / f"{base}_translated_blocks.md"
+    checklist_path = process_dir / f"{base}_复合方法checklist.md"
+    json_path = process_dir / f"{base}_复合方法明细.json"
     if cancelled:
         cancelled_docx_path = docx_path.with_name(f"{docx_path.stem}{suffix}{docx_path.suffix}")
         os.replace(str(docx_path), str(cancelled_docx_path))
         docx_path = cancelled_docx_path
+        source_md_path = source_md_path.with_name(f"{source_md_path.stem}{suffix}{source_md_path.suffix}")
         translated_md_path = translated_md_path.with_name(f"{translated_md_path.stem}{suffix}{translated_md_path.suffix}")
         checklist_path = checklist_path.with_name(f"{checklist_path.stem}{suffix}{checklist_path.suffix}")
         json_path = json_path.with_name(f"{json_path.stem}{suffix}{json_path.suffix}")
 
+    write_process_files_note(process_dir)
     source_md_path.write_text(source_markdown, encoding="utf-8")
     translated_md_path.write_text(build_translated_blocks_markdown(blocks, translated_blocks), encoding="utf-8")
     checklist_path.write_text(checklist_markdown(checklist), encoding="utf-8")
@@ -2201,7 +2218,12 @@ class HybridApp:
         self.start_button.config(state="normal")
         self.stop_button.config(state="disabled")
         title = "已中止并导出" if cancelled else "完成"
-        messagebox.showinfo(title, "已输出：\n" + "\n".join(str(path) for path in paths))
+        messagebox.showinfo(
+            title,
+            "已输出：\n"
+            + "\n".join(str(path) for path in paths)
+            + "\n\n说明：输出目录里的“过程文件”文件夹只用于排查问题；如果 Word 译文确认没问题，可以删除。",
+        )
 
     def finish_error(self, error: str):
         self.start_button.config(state="normal")
