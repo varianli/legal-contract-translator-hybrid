@@ -34,7 +34,12 @@ PROVIDER_DEFAULTS = {
     "OpenAI": {"base_url": "", "model": "gpt-4.1", "key_label": "OpenAI API Key"},
     "DeepSeek": {"base_url": "https://api.deepseek.com", "model": "deepseek-v4-flash", "key_label": "DeepSeek API Key"},
 }
-APP_VERSION = "v1.4"
+APP_VERSION = "v1.5"
+ENGLISH_FONT_OPTIONS = ("Times New Roman", "Calibri")
+CHINESE_FONT_OPTIONS = ("楷体_GB2312", "宋体")
+DEFAULT_ENGLISH_FONT = "Times New Roman"
+DEFAULT_CHINESE_FONT = "宋体"
+DIGIT_FONT = "Times New Roman"
 
 SYSTEM_PROMPT = """You are a senior bilingual legal translator and document-format alignment specialist.
 Translate Chinese legal contracts into precise formal legal English.
@@ -153,6 +158,24 @@ def legal_rag_for_text(text: str) -> str:
     if not retrieved:
         return CAPITAL_MARKETS_LEGAL_RAG
     return CAPITAL_MARKETS_LEGAL_RAG + "\n\nRetrieved terms for this chunk:\n- " + "\n- ".join(retrieved)
+
+
+def valid_english_font(font_name: str) -> str:
+    return font_name if font_name in ENGLISH_FONT_OPTIONS else DEFAULT_ENGLISH_FONT
+
+
+def valid_chinese_font(font_name: str) -> str:
+    return font_name if font_name in CHINESE_FONT_OPTIONS else DEFAULT_CHINESE_FONT
+
+
+def build_font_instruction(english_font: str, chinese_font: str) -> str:
+    english_font = valid_english_font(english_font)
+    chinese_font = valid_chinese_font(chinese_font)
+    return (
+        f"Font preference for the exported Word document: use {english_font} for English Latin letters, "
+        f"use {DIGIT_FONT} for all Arabic numerals/digits, and use {chinese_font} for any retained Chinese characters "
+        "such as company names, marks, or placeholders. Preserve legal meaning even when applying these font preferences."
+    )
 
 
 def normalize_english_punctuation(text: str) -> str:
@@ -311,9 +334,20 @@ def load_config() -> dict:
     return {}
 
 
-def save_config(provider: str, api_key: str, base_url: str, model: str) -> None:
+def save_config(provider: str, api_key: str, base_url: str, model: str, english_font: str, chinese_font: str) -> None:
     CONFIG_PATH.write_text(
-        json.dumps({"provider": provider, "api_key": api_key, "base_url": base_url, "model": model}, ensure_ascii=False, indent=2),
+        json.dumps(
+            {
+                "provider": provider,
+                "api_key": api_key,
+                "base_url": base_url,
+                "model": model,
+                "english_font": english_font,
+                "chinese_font": chinese_font,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
         encoding="utf-8",
     )
 
@@ -585,7 +619,7 @@ def build_chunks(blocks: list[dict], max_chars: int = 35000, max_blocks: int = 4
     return chunks
 
 
-def make_translation_memory(client: OpenAI, provider: str, model: str, source_markdown: str, log) -> str:
+def make_translation_memory(client: OpenAI, provider: str, model: str, source_markdown: str, log, font_instruction: str) -> str:
     log("正在基于 Markdown 结构提取术语表和翻译规则...")
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -594,6 +628,7 @@ def make_translation_memory(client: OpenAI, provider: str, model: str, source_ma
             "content": (
                 "Create a concise bilingual translation memory for this Chinese legal contract represented as Markdown blocks.\n"
                 "Return JSON {\"memory\":\"...\"}. Include defined terms, parties, recurring phrases, bracket placeholders, and legal drafting preferences.\n\n"
+                f"FONT INSTRUCTIONS:\n{font_instruction}\n\n"
                 f"CAPITAL MARKETS LEGAL RAG:\n{legal_rag_for_text(source_markdown)}\n\n"
                 f"MARKDOWN:\n{compact_text(source_markdown, 60000)}"
             ),
@@ -606,7 +641,16 @@ def make_translation_memory(client: OpenAI, provider: str, model: str, source_ma
         return ""
 
 
-def translate_markdown_chunk(client: OpenAI, provider: str, model: str, memory: str, chunk_markdown: str, before: str, after: str) -> str:
+def translate_markdown_chunk(
+    client: OpenAI,
+    provider: str,
+    model: str,
+    memory: str,
+    chunk_markdown: str,
+    before: str,
+    after: str,
+    font_instruction: str,
+) -> str:
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {
@@ -624,6 +668,7 @@ def translate_markdown_chunk(client: OpenAI, provider: str, model: str, memory: 
                 "A. Markdown carries clause hierarchy, indentation/list cues, and some visible formatting signals, but it is not the complete Word run structure.\n"
                 "B. Translate under the Markdown structure first so the English keeps context and legal coherence.\n"
                 "C. Keep each BLOCK independent after translation because run-level formatting will be checked and applied block by block.\n\n"
+                f"FONT INSTRUCTIONS:\n{font_instruction}\n\n"
                 f"CAPITAL MARKETS LEGAL RAG:\n{legal_rag_for_text(chunk_markdown)}\n\n"
                 f"TRANSLATION MEMORY:\n{memory or '(none)'}\n\n"
                 f"CONTEXT BEFORE:\n{compact_text(before, 3000)}\n\n"
@@ -671,7 +716,7 @@ def build_repair_batches(blocks: list[dict], max_chars: int = 12000, max_blocks:
     return batches
 
 
-def repair_translation_batch(client: OpenAI, provider: str, model: str, memory: str, batch: list[dict]) -> dict[int, str]:
+def repair_translation_batch(client: OpenAI, provider: str, model: str, memory: str, batch: list[dict], font_instruction: str) -> dict[int, str]:
     payload = [{"id": block["id"], "source_text": block["text"]} for block in batch]
     source_text = "\n".join(item["source_text"] for item in payload)
     messages = [
@@ -687,6 +732,7 @@ def repair_translation_batch(client: OpenAI, provider: str, model: str, memory: 
                 "3. Do not leave Chinese prose in the translation.\n"
                 "4. Proper names may use the format English Name (Chinese Name) where appropriate; brand marks in quoted lists may retain Chinese characters when they are the mark itself.\n"
                 "5. Preserve numbers, defined terms, brackets, placeholders, clause references, and round names such as B5 Round / Pre-IPO Round.\n\n"
+                f"FONT INSTRUCTIONS:\n{font_instruction}\n\n"
                 f"CAPITAL MARKETS LEGAL RAG:\n{legal_rag_for_text(source_text)}\n\n"
                 f"TRANSLATION MEMORY:\n{memory or '(none)'}\n\n"
                 f"BLOCKS JSON:\n{json.dumps({'blocks': payload}, ensure_ascii=False)}"
@@ -717,6 +763,7 @@ def repair_chunk_translations(
     progress,
     completed: int,
     total: int,
+    font_instruction: str,
 ) -> set[int]:
     block_by_id = {int(block["id"]): block for block in chunk}
     bad_blocks = []
@@ -736,7 +783,7 @@ def repair_chunk_translations(
     for index, batch in enumerate(batches, start=1):
         progress(completed, total, f"自修复漏翻/中文残留 {index}/{len(batches)}")
         try:
-            repaired = repair_translation_batch(client, provider, model, memory, batch)
+            repaired = repair_translation_batch(client, provider, model, memory, batch, font_instruction)
         except Exception as exc:
             log(f"批量自修复失败，改为逐段修复。原因：{exc}")
             repaired = {}
@@ -753,7 +800,7 @@ def repair_chunk_translations(
             if block_id in repaired_ids and not needs_translation_repair(block["text"], translations.get(block_id, "")):
                 continue
             try:
-                single = repair_translation_batch(client, provider, model, memory, [block])
+                single = repair_translation_batch(client, provider, model, memory, [block], font_instruction)
             except Exception as exc:
                 log(f"block {block_id} 单段自修复失败：{exc}")
                 continue
@@ -773,6 +820,7 @@ def repair_all_translations(
     translations: dict[int, str],
     log,
     progress,
+    font_instruction: str,
     max_rounds: int = 5,
 ) -> set[int]:
     repaired_ids: set[int] = set()
@@ -796,7 +844,7 @@ def repair_all_translations(
         for batch_index, batch in enumerate(batches, start=1):
             progress(total - len(bad_blocks), total, f"全文自修复第 {round_index} 轮 {batch_index}/{len(batches)}")
             try:
-                repaired = repair_translation_batch(client, provider, model, memory, batch)
+                repaired = repair_translation_batch(client, provider, model, memory, batch, font_instruction)
             except Exception as exc:
                 log(f"批量自修复失败，改为逐段修复。原因：{exc}")
                 repaired = {}
@@ -815,7 +863,7 @@ def repair_all_translations(
                 if not needs_translation_repair(block["text"], translations.get(block_id, "")):
                     continue
                 try:
-                    single = repair_translation_batch(client, provider, model, memory, [block])
+                    single = repair_translation_batch(client, provider, model, memory, [block], font_instruction)
                 except Exception as exc:
                     log(f"block {block_id} 单段自修复失败：{exc}")
                     continue
@@ -839,7 +887,15 @@ def repair_all_translations(
     return repaired_ids
 
 
-def map_format_spans(client: OpenAI, provider: str, model: str, memory: str, source_blocks: list[dict], translated_blocks: dict[int, str]) -> list[dict]:
+def map_format_spans(
+    client: OpenAI,
+    provider: str,
+    model: str,
+    memory: str,
+    source_blocks: list[dict],
+    translated_blocks: dict[int, str],
+    font_instruction: str,
+) -> list[dict]:
     payload = []
     for block in source_blocks:
         spans = block["format_spans"]
@@ -873,6 +929,7 @@ def map_format_spans(client: OpenAI, provider: str, model: str, memory: str, sou
                 "C. For every span, record the formatted source content, locate the legally corresponding exact phrase in that block's English translation, and return it as target_text.\n"
                 "D. Finish all spans in the current block before moving to the next block.\n"
                 "E. If a target is uncertain, still return the closest contiguous legally equivalent English phrase and explain the uncertainty in note.\n\n"
+                f"FONT INSTRUCTIONS:\n{font_instruction}\n\n"
                 f"CAPITAL MARKETS LEGAL RAG:\n{legal_rag_for_text(payload_text)}\n\n"
                 f"TRANSLATION MEMORY:\n{memory or '(none)'}\n\n"
                 f"BLOCKS JSON:\n{json.dumps({'blocks': payload}, ensure_ascii=False)}"
@@ -1001,14 +1058,37 @@ def apply_base_format(run, base_format: dict[str, bool]) -> None:
         set_highlight_none(run)
 
 
-def add_run_with_base_format(paragraph, text: str, base_format: dict[str, bool]):
+FONT_TOKEN_RE = re.compile(r"\d[\d,.\-/%:]*|[\u3400-\u9fff]+|[^\d\u3400-\u9fff]+")
+
+
+def split_font_tokens(text: str) -> list[str]:
+    return [match.group(0) for match in FONT_TOKEN_RE.finditer(text or "")]
+
+
+def set_run_fonts(run, token: str, english_font: str, chinese_font: str) -> None:
+    ascii_font = DIGIT_FONT if token and token[0].isdigit() else valid_english_font(english_font)
+    chinese_font = valid_chinese_font(chinese_font)
+    rpr = run._r.get_or_add_rPr()
+    rfonts = rpr.rFonts
+    if rfonts is None:
+        rfonts = OxmlElement("w:rFonts")
+        rpr.append(rfonts)
+    rfonts.set(qn("w:ascii"), ascii_font)
+    rfonts.set(qn("w:hAnsi"), ascii_font)
+    rfonts.set(qn("w:cs"), ascii_font)
+    rfonts.set(qn("w:eastAsia"), chinese_font)
+
+
+def add_run_with_base_format(paragraph, text: str, base_format: dict[str, bool], english_font: str, chinese_font: str):
     run = paragraph.add_run(text)
     apply_base_format(run, base_format)
+    set_run_fonts(run, text, english_font, chinese_font)
     return run
 
 
-def apply_style(run, span: FormatSpan, base_format: dict[str, bool]) -> None:
+def apply_style(run, span: FormatSpan, base_format: dict[str, bool], english_font: str, chinese_font: str) -> None:
     apply_base_format(run, base_format)
+    set_run_fonts(run, run.text, english_font, chinese_font)
     if span.bold:
         run.bold = True
     if span.italic:
@@ -1019,7 +1099,14 @@ def apply_style(run, span: FormatSpan, base_format: dict[str, bool]) -> None:
         run.font.highlight_color = span.highlight_color
 
 
-def rewrite_paragraph(paragraph, translation: str, intervals: list[dict]) -> None:
+def add_text_runs(paragraph, text: str, base_format: dict[str, bool], english_font: str, chinese_font: str, span: FormatSpan | None = None) -> None:
+    for token in split_font_tokens(text):
+        run = add_run_with_base_format(paragraph, token, base_format, english_font, chinese_font)
+        if span is not None:
+            apply_style(run, span, base_format, english_font, chinese_font)
+
+
+def rewrite_paragraph(paragraph, translation: str, intervals: list[dict], english_font: str, chinese_font: str) -> None:
     intervals = sorted(intervals, key=lambda item: (item["start"], item["end"]))
     base_format = base_format_overrides(paragraph)
     clear_paragraph_runs(paragraph)
@@ -1030,14 +1117,13 @@ def rewrite_paragraph(paragraph, translation: str, intervals: list[dict]) -> Non
         if start < cursor or end <= start:
             continue
         if cursor < start:
-            add_run_with_base_format(paragraph, translation[cursor:start], base_format)
-        run = add_run_with_base_format(paragraph, translation[start:end], base_format)
-        apply_style(run, item["span"], base_format)
+            add_text_runs(paragraph, translation[cursor:start], base_format, english_font, chinese_font)
+        add_text_runs(paragraph, translation[start:end], base_format, english_font, chinese_font, item["span"])
         cursor = end
     if cursor < len(translation):
-        add_run_with_base_format(paragraph, translation[cursor:], base_format)
+        add_text_runs(paragraph, translation[cursor:], base_format, english_font, chinese_font)
     if not translation:
-        add_run_with_base_format(paragraph, "", base_format)
+        add_run_with_base_format(paragraph, "", base_format, english_font, chinese_font)
 
 
 def safe_save_document(doc: Document, output_path: Path) -> Path:
@@ -1085,11 +1171,16 @@ def translate_docx_hybrid(
     api_key: str,
     base_url: str,
     model: str,
+    english_font: str,
+    chinese_font: str,
     log,
     progress,
     cancel_event: threading.Event | None = None,
 ) -> tuple[Path, Path, Path, Path, Path, bool]:
     output_dir.mkdir(parents=True, exist_ok=True)
+    english_font = valid_english_font(english_font)
+    chinese_font = valid_chinese_font(chinese_font)
+    font_instruction = build_font_instruction(english_font, chinese_font)
     doc = Document(str(input_path))
     paragraphs = list(iter_document_paragraphs(doc))
     blocks = []
@@ -1113,9 +1204,10 @@ def translate_docx_hybrid(
 
     source_markdown = "\n\n".join(block["markdown"] for block in blocks)
     client = build_client(api_key, base_url)
-    memory = make_translation_memory(client, provider, model, source_markdown, log)
+    memory = make_translation_memory(client, provider, model, source_markdown, log, font_instruction)
     chunks = build_chunks(blocks)
     log(f"{APP_VERSION} 复合方法：{len(blocks)} 个中文 block，分为 {len(chunks)} 个 Markdown 大段批次。")
+    log(f"字体设置：英文 {english_font}；数字 {DIGIT_FONT}；中文 {chinese_font}。")
 
     translated_blocks: dict[int, str] = {}
     translated_markdown_parts = []
@@ -1133,7 +1225,7 @@ def translate_docx_hybrid(
         after_start = blocks.index(chunk[-1]) + 1
         after = "\n\n".join(block["markdown"] for block in blocks[after_start : min(len(blocks), after_start + 3)])
         progress(completed, len(blocks), f"翻译 Markdown 大段 {chunk_index}/{len(chunks)}")
-        translated_markdown = translate_markdown_chunk(client, provider, model, memory, chunk_markdown, before, after)
+        translated_markdown = translate_markdown_chunk(client, provider, model, memory, chunk_markdown, before, after, font_instruction)
         translated_markdown_parts.append(translated_markdown)
         chunk_translations = parse_translated_markdown(translated_markdown)
         for block in chunk:
@@ -1151,7 +1243,7 @@ def translate_docx_hybrid(
 
     if not cancelled:
         auto_repaired_blocks.update(
-            repair_all_translations(client, provider, model, memory, blocks, translated_blocks, log, progress)
+            repair_all_translations(client, provider, model, memory, blocks, translated_blocks, log, progress, font_instruction)
         )
     all_mappings = []
     for chunk_index, chunk in enumerate(chunks, start=1):
@@ -1160,7 +1252,7 @@ def translate_docx_hybrid(
             continue
         progress(len(blocks), len(blocks), f"映射格式 {chunk_index}/{len(chunks)}")
         chunk_translations = {int(block["id"]): translated_blocks.get(int(block["id"]), "") for block in ready_chunk}
-        all_mappings.extend(map_format_spans(client, provider, model, memory, ready_chunk, chunk_translations))
+        all_mappings.extend(map_format_spans(client, provider, model, memory, ready_chunk, chunk_translations, font_instruction))
 
     mappings_by_span = {str(mapping.get("span_id")): mapping for mapping in all_mappings if mapping.get("span_id")}
     checklist = []
@@ -1257,7 +1349,7 @@ def translate_docx_hybrid(
             checklist.append(row)
         if needs_translation_repair(block["text"], translation):
             checklist.append({"status": "HAS_CHINESE_IN_TRANSLATION", "block_id": block_id, "note": "译文仍疑似存在漏翻或大段中文残留。"})
-        rewrite_paragraph(paragraphs[block_id], translation, intervals)
+        rewrite_paragraph(paragraphs[block_id], translation, intervals, english_font, chinese_font)
 
     base = input_path.stem
     suffix = "_已中止" if cancelled else ""
@@ -1302,6 +1394,8 @@ class HybridApp:
         self.api_key = StringVar(value=config.get("api_key", ""))
         self.base_url = StringVar(value=config.get("base_url", defaults["base_url"]))
         self.model = StringVar(value=config.get("model", defaults["model"]))
+        self.english_font = StringVar(value=valid_english_font(config.get("english_font", DEFAULT_ENGLISH_FONT)))
+        self.chinese_font = StringVar(value=valid_chinese_font(config.get("chinese_font", DEFAULT_CHINESE_FONT)))
         self.file_path = StringVar(value="")
         self.output_dir = StringVar(value=str(OUTPUT_DIR))
         self.remember_key = BooleanVar(value=bool(config.get("api_key")))
@@ -1318,6 +1412,16 @@ class HybridApp:
         Entry(top, textvariable=self.base_url, width=90).pack(fill=X, pady=(4, 8))
         Label(top, text="模型").pack(anchor="w")
         Entry(top, textvariable=self.model, width=90).pack(fill=X, pady=(4, 8))
+        font_row = Frame(top)
+        font_row.pack(fill=X, pady=(0, 8))
+        left_font = Frame(font_row)
+        left_font.pack(side=LEFT, fill=X, expand=True)
+        Label(left_font, text="英文字体（字母）").pack(anchor="w")
+        OptionMenu(left_font, self.english_font, *ENGLISH_FONT_OPTIONS).pack(fill=X, pady=(4, 0))
+        right_font = Frame(font_row)
+        right_font.pack(side=RIGHT, fill=X, expand=True, padx=(12, 0))
+        Label(right_font, text=f"中文字体（数字固定 {DIGIT_FONT}）").pack(anchor="w")
+        OptionMenu(right_font, self.chinese_font, *CHINESE_FONT_OPTIONS).pack(fill=X, pady=(4, 0))
         Checkbutton(top, text="记住 API Key（明文保存在本机复合方法目录）", variable=self.remember_key).pack(anchor="w")
 
         file_frame = Frame(root, padx=16, pady=8)
@@ -1403,6 +1507,8 @@ class HybridApp:
         api_key = self.api_key.get().strip()
         base_url = self.base_url.get().strip()
         model = self.model.get().strip()
+        english_font = valid_english_font(self.english_font.get().strip())
+        chinese_font = valid_chinese_font(self.chinese_font.get().strip())
         input_path = Path(self.file_path.get().strip().strip('"'))
         output_dir = Path(self.output_dir.get().strip().strip('"'))
         if not api_key:
@@ -1417,12 +1523,17 @@ class HybridApp:
         if provider == "DeepSeek" and not base_url:
             base_url = PROVIDER_DEFAULTS["DeepSeek"]["base_url"]
             self.base_url.set(base_url)
-        if self.remember_key.get():
-            save_config(provider, api_key, base_url, model)
+        self.english_font.set(english_font)
+        self.chinese_font.set(chinese_font)
+        save_config(provider, api_key if self.remember_key.get() else "", base_url, model, english_font, chinese_font)
         self.cancel_event.clear()
         self.start_button.config(state="disabled")
         self.stop_button.config(state="normal")
-        thread = threading.Thread(target=self.worker, args=(input_path, output_dir, provider, api_key, base_url, model), daemon=True)
+        thread = threading.Thread(
+            target=self.worker,
+            args=(input_path, output_dir, provider, api_key, base_url, model, english_font, chinese_font),
+            daemon=True,
+        )
         thread.start()
 
     def request_cancel(self):
@@ -1431,9 +1542,31 @@ class HybridApp:
         self.log("已请求中止；当前 API 批次返回后会导出当前进度。")
         self.update_progress(0, 0, "正在等待当前批次返回，然后导出当前进度...")
 
-    def worker(self, input_path: Path, output_dir: Path, provider: str, api_key: str, base_url: str, model: str):
+    def worker(
+        self,
+        input_path: Path,
+        output_dir: Path,
+        provider: str,
+        api_key: str,
+        base_url: str,
+        model: str,
+        english_font: str,
+        chinese_font: str,
+    ):
         try:
-            paths = translate_docx_hybrid(input_path, output_dir, provider, api_key, base_url, model, self.log, self.update_progress, self.cancel_event)
+            paths = translate_docx_hybrid(
+                input_path,
+                output_dir,
+                provider,
+                api_key,
+                base_url,
+                model,
+                english_font,
+                chinese_font,
+                self.log,
+                self.update_progress,
+                self.cancel_event,
+            )
             self.root.after(0, self.finish_success, paths[:-1], paths[-1])
         except Exception as exc:
             self.log("发生错误：")
