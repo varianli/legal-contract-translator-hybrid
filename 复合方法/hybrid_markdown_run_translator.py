@@ -34,7 +34,7 @@ PROVIDER_DEFAULTS = {
     "OpenAI": {"base_url": "", "model": "gpt-4.1", "key_label": "OpenAI API Key"},
     "DeepSeek": {"base_url": "https://api.deepseek.com", "model": "deepseek-v4-flash", "key_label": "DeepSeek API Key"},
 }
-APP_VERSION = "v1.11"
+APP_VERSION = "v1.13"
 ENGLISH_FONT_OPTIONS = ("Times New Roman", "Calibri")
 CHINESE_FONT_OPTIONS = ("楷体_GB2312", "宋体")
 DEFAULT_ENGLISH_FONT = "Times New Roman"
@@ -42,17 +42,19 @@ DEFAULT_CHINESE_FONT = "宋体"
 DIGIT_FONT = "Times New Roman"
 PROGRESS_TOTAL = 100
 ENABLE_COMPANY_NAME_GLOSSARY = False
+STRICT_NO_CJK_OUTPUT = True
 
 SYSTEM_PROMPT = """You are a senior bilingual legal translator and document-format alignment specialist.
 Translate Chinese legal contracts into precise formal legal English.
 Preserve legal meaning, defined terms, numbering, dates, parties, amounts, placeholders, and clause references.
+The final English output must not contain Chinese/CJK characters; translate or romanize proper names instead of using English (Chinese) format.
 Return only valid JSON when JSON is requested."""
 
 FINAL_AUDIT_SYSTEM_PROMPT = """You are a senior legal translation QA reviewer.
-Your task is to quickly audit completed English translations of Chinese capital-markets legal documents and identify only blocks that still contain untranslated Chinese/CJK legal content.
-Flag a block when Chinese/CJK characters remain as substantive legal prose, clause headings, table labels, sentence fragments, or mixed Chinese-English leftovers.
-Do not enforce English Name (Chinese Name) formatting for company, fund, shareholder, investor, or person names.
-Do not flag Chinese/CJK characters that are intentionally retained as part of company names, fund names, investor short names, trademark/brand marks, original placeholders inside 【】, or source-required bracket blanks.
+Your task is to quickly audit completed English translations of Chinese capital-markets legal documents under a strict English-only final-output policy.
+Flag any block whose translation still contains Chinese/CJK characters, including legal prose, clause headings, table labels, TOC entries, company names, fund names, investor names, person names, addresses, trademarks, parentheticals, or mixed Chinese-English leftovers.
+Do not allow English Name (Chinese Name) formatting. Translate or romanize Chinese proper names into English-only text.
+Preserve source placeholder symbols such as 【】 and blanks, but translate any Chinese words inside placeholders.
 Return only valid JSON."""
 
 CAPITAL_MARKETS_LEGAL_RAG = """Capital markets legal English retrieval notes:
@@ -64,7 +66,7 @@ CAPITAL_MARKETS_LEGAL_RAG = """Capital markets legal English retrieval notes:
 - Translate \u4ea4\u5272 as Closing, \u4ea4\u5272\u65e5 as Closing Date, \u6700\u8fdf\u5b8c\u6210\u65e5 as Longstop Date, \u7b7e\u7f72\u65e5 as Signing Date.
 - Translate \u672c\u6b21\u4ea4\u6613 as this Transaction, \u6295\u8d44\u6b3e as Investment Amount, \u76ee\u6807\u516c\u53f8 as Target Company, \u96c6\u56e2\u516c\u53f8 as Group Company / Group Companies.
 - For RMB amounts expressed as \u4eba\u6c11\u5e01X\u4e07\u5143, convert to yuan in English: \u4eba\u6c11\u5e0112.7764\u4e07\u5143 -> RMB 127,764. Do not output Ten Thousand Yuan or million for \u4e07\u5143.
-- Preserve source \u3010...\u3011 bracket placeholders exactly. \u3010\u3011 stays \u3010\u3011, not [] or underscores; \u3010number\u3011 stays in \u3010number\u3011 form after translation/conversion.
+- Preserve source \u3010...\u3011 bracket placeholder symbols exactly. \u3010\u3011 stays \u3010\u3011, not [] or underscores; if a placeholder contains Chinese text, translate the text inside the brackets while keeping the \u3010...\u3011 form.
 - Preserve defined-term capitalization once established. If the same Chinese term recurs, reuse the same English term.
 - Use English punctuation in English output: straight quotes, half-width commas, periods, semicolons, colons, and parentheses, while preserving source \u3010...\u3011 placeholders."""
 
@@ -353,8 +355,9 @@ def build_font_instruction(english_font: str, chinese_font: str) -> str:
     chinese_font = valid_chinese_font(chinese_font)
     return (
         f"Font preference for the exported Word document: use {english_font} for English Latin letters, "
-        f"use {DIGIT_FONT} for all Arabic numerals/digits, and use {chinese_font} for any retained Chinese characters "
-        "such as company names, marks, or placeholders. Preserve legal meaning even when applying these font preferences."
+        f"use {DIGIT_FONT} for all Arabic numerals/digits. The final English translation should not retain Chinese/CJK "
+        f"characters; {chinese_font} is only a fallback font if a source-required symbol or placeholder forces non-Latin text. "
+        "Preserve legal meaning even when applying these font preferences."
     )
 
 
@@ -448,6 +451,8 @@ def preserve_source_bracket_tokens(source_text: str, translation: str) -> str:
     for content in SOURCE_BRACKET_RE.findall(source_text or ""):
         target = f"\u3010{content}\u3011"
         if target in result:
+            continue
+        if content and has_cjk(content):
             continue
         if content:
             result = re.sub(r"\[\s*" + re.escape(content) + r"\s*\]", target, result, count=1)
@@ -925,7 +930,8 @@ def translate_markdown_chunk(
                 "2. Preserve Markdown heading/list/paragraph structure where reasonable.\n"
                 "3. Translate the visible Chinese text into English using the whole chunk context.\n"
                 "4. Do not translate or remove <!-- META:... --> comments.\n"
-                "5. Do not leave Chinese characters unless intentionally part of a name or exhibit label.\n\n"
+                "5. Do not leave any Chinese/CJK characters in visible translated text. Do not use English Name (Chinese Name) formatting.\n"
+                "6. Translate or romanize Chinese company, fund, person, address, exhibit, appendix, and brand/trademark names into English-only text.\n\n"
                 "Workflow reminder:\n"
                 "A. Markdown carries clause hierarchy, indentation/list cues, and some visible formatting signals, but it is not the complete Word run structure.\n"
                 "B. Translate under the Markdown structure first so the English keeps context and legal coherence.\n"
@@ -954,6 +960,8 @@ def needs_translation_repair(source_text: str, translation: str) -> bool:
     count = cjk_count(translation)
     if not count:
         return False
+    if STRICT_NO_CJK_OUTPUT:
+        return True
     compact_len = max(1, len(re.sub(r"\s+", "", translation)))
     source_count = max(1, cjk_count(source_text))
     ascii_letters = len(re.findall(r"[A-Za-z]", translation))
@@ -992,9 +1000,9 @@ def repair_translation_batch(client: OpenAI, provider: str, model: str, memory: 
                 "Rules:\n"
                 "1. Return one translation for every input id.\n"
                 "2. Translate all Chinese legal prose into formal legal English.\n"
-                "3. Do not leave Chinese prose in the translation.\n"
-                "4. Proper names may use the format English Name (Chinese Name) where appropriate; brand marks in quoted lists may retain Chinese characters when they are the mark itself.\n"
-                "5. Preserve numbers, defined terms, brackets, placeholders, clause references, and round names such as B5 Round / Pre-IPO Round.\n\n"
+                "3. Do not leave any Chinese/CJK characters in the translation.\n"
+                "4. Do not use English Name (Chinese Name) formatting; render Chinese company, fund, person, address, and trademark/brand names in English-only form by using the official English name where known or a reasonable romanized/legal-English rendering.\n"
+                "5. Preserve numbers, defined terms, bracket symbols, blanks, placeholders, clause references, and round names such as B5 Round / Pre-IPO Round. If Chinese appears inside 【】, translate the bracket content but keep the 【】 symbols.\n\n"
                 f"FONT INSTRUCTIONS:\n{font_instruction}\n\n"
                 f"COMPANY/INSTITUTION NAME GLOSSARY:\n{company_glossary}\n\n"
                 f"CAPITAL MARKETS LEGAL RAG:\n{legal_rag_for_text(source_text)}\n\n"
@@ -1238,15 +1246,13 @@ def final_llm_audit_batch(
                 "Return JSON exactly like {\"issues\":[{\"id\":123,\"reason\":\"...\",\"chinese_fragment\":\"...\"}]}.\n"
                 "Return an empty issues array if all blocks pass.\n\n"
                 "What to flag:\n"
-                "- Untranslated Chinese legal prose, headings, labels, table cells, or sentence fragments.\n"
-                "- Chinese text appended to an otherwise English translation.\n"
-                "- Chinese legal text that remains mixed into an otherwise English sentence.\n\n"
+                "- Any Chinese/CJK character remaining in the English translation.\n"
+                "- Chinese legal prose, headings, labels, table cells, TOC entries, sentence fragments, or parentheticals.\n"
+                "- Chinese company, fund, shareholder, investor, person, trademark, brand, addressee, or address names.\n"
+                "- Chinese text appended to or mixed into an otherwise English sentence.\n\n"
                 "What not to flag:\n"
-                "- Chinese inside a translated proper-name parenthetical, e.g. Shanghai Example Technology Co., Ltd. (上海示例科技有限公司).\n"
-                "- Chinese company, fund, shareholder, investor, person, trademark, or brand names retained for legal identification.\n"
-                "- Original placeholders inside 【】 or blank placeholders.\n"
-                "- Chinese trademark/brand marks intentionally retained with English context.\n"
-                "- A company or fund name solely because it is not written as English Name (Chinese Name).\n\n"
+                "- The bracket symbols 【】 themselves or blank placeholders such as 【】, as long as the text inside them is not Chinese/CJK.\n"
+                "- English-only romanized or official English proper names.\n\n"
                 f"COMPANY/INSTITUTION NAME GLOSSARY:\n{company_glossary}\n\n"
                 f"CAPITAL MARKETS LEGAL RAG:\n{legal_rag_for_text(rag_text)}\n\n"
                 f"BLOCKS JSON:\n{json.dumps({'blocks': payload}, ensure_ascii=False)}"
@@ -1257,6 +1263,20 @@ def final_llm_audit_batch(
     batch_ids = {int(block["id"]) for block in batch}
     issues = deterministic_company_name_audit_issues(batch, translations, company_entries)
     issue_ids = {int(issue["id"]) for issue in issues}
+    if STRICT_NO_CJK_OUTPUT:
+        for block in batch:
+            block_id = int(block["id"])
+            translation = translations.get(block_id, "")
+            if cjk_count(translation) and block_id not in issue_ids:
+                fragment = "".join(re.findall(r"[\u3400-\u9fff]+", translation))[:80]
+                issues.append(
+                    {
+                        "id": block_id,
+                        "reason": "Strict final-output policy: translation still contains Chinese/CJK characters.",
+                        "chinese_fragment": fragment,
+                    }
+                )
+                issue_ids.add(block_id)
     for item in data.get("issues", []) or []:
         try:
             block_id = int(item.get("id"))
@@ -1638,6 +1658,150 @@ def rewrite_paragraph(paragraph, translation: str, intervals: list[dict], englis
         add_run_with_base_format(paragraph, "", base_format, english_font, chinese_font)
 
 
+def normalize_final_cleanup_text(text: str) -> str:
+    text = strip_markdown_emphasis(text or "")
+    text = text.translate(CJK_PUNCT_TRANSLATION)
+    text = re.sub(r" +([,.;:!?\]\)])", r"\1", text)
+    text = re.sub(r"([\[\(]) +", r"\1", text)
+    text = re.sub(r"([,;:!?])(?=[A-Za-z\"'])", r"\1 ", text)
+    text = re.sub(r"(?<!\d)(\.)(?=[A-Za-z\"'])", r"\1 ", text)
+    text = re.sub(r"(?<=\d), +(?=\d{3}\b)", ",", text)
+    text = re.sub(r"(?<=\d)\. +(?=\d)", ".", text)
+    text = re.sub(r" {2,}", " ", text)
+    return text.strip()
+
+
+def collect_cjk_document_paragraphs(doc: Document) -> list[dict]:
+    items = []
+    for index, paragraph in enumerate(iter_document_paragraphs(doc)):
+        text = paragraph_text(paragraph)
+        if cjk_count(text):
+            items.append(
+                {
+                    "id": index,
+                    "paragraph": paragraph,
+                    "text": text,
+                    "style": paragraph.style.name if paragraph.style else "",
+                }
+            )
+    return items
+
+
+def build_final_doc_cleanup_batches(items: list[dict], max_chars: int = 12000, max_items: int = 18) -> list[list[dict]]:
+    batches = []
+    current = []
+    current_chars = 0
+    for item in items:
+        size = len(item.get("text", "")) + 300
+        if current and (current_chars + size > max_chars or len(current) >= max_items):
+            batches.append(current)
+            current = []
+            current_chars = 0
+        current.append(item)
+        current_chars += size
+    if current:
+        batches.append(current)
+    return batches
+
+
+def final_doc_cleanup_batch(client: OpenAI, provider: str, model: str, memory: str, batch: list[dict], font_instruction: str) -> dict[int, str]:
+    payload = [
+        {
+            "id": int(item["id"]),
+            "style": item.get("style", ""),
+            "text": item.get("text", ""),
+        }
+        for item in batch
+    ]
+    source_text = "\n".join(item["text"] for item in payload)
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                "Final visible Word sweep for an already translated English legal document.\n"
+                "Some paragraphs still contain Chinese/CJK characters. Translate or romanize only the remaining Chinese/CJK parts while preserving the existing English text.\n"
+                "Return JSON exactly like {\"items\":[{\"id\":123,\"translation\":\"...\"}]}.\n\n"
+                "Rules:\n"
+                "1. Return one cleaned paragraph for every input id.\n"
+                "2. The returned translation must contain no Chinese/CJK characters.\n"
+                "3. Do not use English Name (Chinese Name) formatting; use official English names where known, otherwise use English-only romanization or legal-English rendering.\n"
+                "4. Preserve tabs, numbering, page numbers, clause references, dates, amounts, punctuation intent, and line order as much as possible.\n"
+                "5. If a paragraph is a table-of-contents line, translate the title and keep the page number.\n"
+                "6. Preserve bracket symbols 【】 and blanks; if Chinese appears inside 【】, translate the bracket content but keep the symbols.\n\n"
+                f"FONT INSTRUCTIONS:\n{font_instruction}\n\n"
+                f"CAPITAL MARKETS LEGAL RAG:\n{legal_rag_for_text(source_text)}\n\n"
+                f"TRANSLATION MEMORY:\n{memory or '(none)'}\n\n"
+                f"PARAGRAPHS JSON:\n{json.dumps({'items': payload}, ensure_ascii=False)}"
+            ),
+        },
+    ]
+    data = chat_json(client, provider, model, messages, retries=2)
+    cleaned = {}
+    for item in data.get("items", []) or []:
+        try:
+            item_id = int(item.get("id"))
+        except (TypeError, ValueError):
+            continue
+        translation = str(item.get("translation", "")).strip()
+        if translation:
+            cleaned[item_id] = translation
+    return cleaned
+
+
+def cleanup_remaining_cjk_in_document(
+    doc: Document,
+    client: OpenAI,
+    provider: str,
+    model: str,
+    memory: str,
+    log,
+    progress,
+    english_font: str,
+    chinese_font: str,
+    font_instruction: str,
+    max_rounds: int = 2,
+) -> tuple[set[int], list[dict]]:
+    cleaned_ids: set[int] = set()
+    remaining: list[dict] = []
+    for round_index in range(1, max_rounds + 1):
+        items = collect_cjk_document_paragraphs(doc)
+        remaining = items
+        if not items:
+            log(f"{APP_VERSION} final Word sweep passed: no Chinese/CJK remains in visible document text.")
+            return cleaned_ids, []
+        log(f"{APP_VERSION} final Word sweep round {round_index}: found {len(items)} visible paragraphs with Chinese/CJK.")
+        changed = False
+        batches = build_final_doc_cleanup_batches(items)
+        for batch_index, batch in enumerate(batches, start=1):
+            progress(len(cleaned_ids), max(1, len(items)), f"{APP_VERSION} final Word Chinese cleanup {batch_index}/{len(batches)}")
+            try:
+                repaired = final_doc_cleanup_batch(client, provider, model, memory, batch, font_instruction)
+            except TranslationCancelled:
+                raise
+            except Exception as exc:
+                log(f"{APP_VERSION} final Word cleanup batch failed and was skipped: {exc}")
+                repaired = {}
+            for item in batch:
+                item_id = int(item["id"])
+                old_text = item.get("text", "")
+                new_text = normalize_final_cleanup_text(repaired.get(item_id, ""))
+                if not new_text or new_text == old_text:
+                    continue
+                if cjk_count(new_text) and cjk_count(new_text) >= cjk_count(old_text):
+                    continue
+                rewrite_paragraph(item["paragraph"], new_text, [], english_font, chinese_font)
+                cleaned_ids.add(item_id)
+                changed = True
+        if not changed:
+            break
+    remaining = collect_cjk_document_paragraphs(doc)
+    if remaining:
+        samples = ", ".join(f"{item['id']}: {compact_text(item['text'], 60)}" for item in remaining[:10])
+        log(f"{APP_VERSION} final Word sweep still found Chinese/CJK after cleanup: {samples}{'...' if len(remaining) > 10 else ''}")
+    return cleaned_ids, remaining
+
+
 def safe_save_document(doc: Document, output_path: Path) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = output_path.with_name(f"{output_path.stem}.tmp.{int(time.time() * 1000)}{output_path.suffix}")
@@ -1859,7 +2023,7 @@ def translate_docx_hybrid(
         )
     for index, block in enumerate(blocks, start=1):
         if index == 1 or index == len(blocks) or index % 25 == 0:
-            report_phase(review_progress, 85, 98, index - 1, len(blocks), f"正在写入译文和格式 {index}/{len(blocks)}")
+            report_phase(review_progress, 85, 94, index - 1, len(blocks), f"正在写入译文和格式 {index}/{len(blocks)}")
         block_id = block["id"]
         translation = normalize_translation_against_source(block["text"], translated_blocks.get(block_id, "").strip())
         intervals = []
@@ -1953,6 +2117,62 @@ def translate_docx_hybrid(
         if needs_translation_repair(block["text"], translation):
             checklist.append({"status": "HAS_CHINESE_IN_TRANSLATION", "block_id": block_id, "note": "译文仍疑似存在漏翻或大段中文残留。"})
         rewrite_paragraph(paragraphs[block_id], translation, intervals, english_font, chinese_font)
+    if not cancelled:
+        try:
+            cleaned_doc_paragraphs, remaining_doc_paragraphs = cleanup_remaining_cjk_in_document(
+                doc,
+                client,
+                provider,
+                model,
+                memory,
+                log,
+                make_phase_progress(review_progress, 94, 98),
+                english_font,
+                chinese_font,
+                font_instruction,
+            )
+            for paragraph_id in sorted(cleaned_doc_paragraphs):
+                checklist.append(
+                    {
+                        "status": "FINAL_DOC_CJK_CLEANUP",
+                        "block_id": f"doc:{paragraph_id}",
+                        "source_text": "",
+                        "style": "",
+                        "target_text": "",
+                        "confidence": "llm-final-sweep",
+                        "note": "最终 Word 可见文本扫尾发现中文/CJK，并已在导出前重翻清理。",
+                    }
+                )
+            for item in remaining_doc_paragraphs:
+                checklist.append(
+                    {
+                        "status": "HAS_CHINESE_IN_FINAL_DOC",
+                        "block_id": f"doc:{item['id']}",
+                        "source_text": compact_text(item.get("text", ""), 120),
+                        "style": item.get("style", ""),
+                        "target_text": "",
+                        "confidence": "",
+                        "note": "最终 Word 可见文本扫尾后仍检测到中文/CJK，请人工复核该段。",
+                    }
+                )
+        except TranslationCancelled:
+            cancelled = True
+            log("收到中止请求；最终 Word 中文扫尾当前批次不再等待，直接导出最近已完成进度。")
+            report_progress(review_progress, 98, "正在导出最近已完成进度")
+        except Exception as exc:
+            log(f"{APP_VERSION} final Word Chinese cleanup failed; exporting current document and recording the issue. Reason: {exc}")
+            for item in collect_cjk_document_paragraphs(doc):
+                checklist.append(
+                    {
+                        "status": "HAS_CHINESE_IN_FINAL_DOC",
+                        "block_id": f"doc:{item['id']}",
+                        "source_text": compact_text(item.get("text", ""), 120),
+                        "style": item.get("style", ""),
+                        "target_text": "",
+                        "confidence": "",
+                        "note": "最终 Word 可见文本扫尾执行失败，该段仍检测到中文/CJK。",
+                    }
+                )
     report_progress(review_progress, 98, "正在导出 Word 和明细文件...")
 
     base = input_path.stem
