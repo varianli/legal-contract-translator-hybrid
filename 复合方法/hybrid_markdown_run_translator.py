@@ -34,7 +34,7 @@ PROVIDER_DEFAULTS = {
     "OpenAI": {"base_url": "", "model": "gpt-4.1", "key_label": "OpenAI API Key"},
     "DeepSeek": {"base_url": "https://api.deepseek.com", "model": "deepseek-v4-flash", "key_label": "DeepSeek API Key"},
 }
-APP_VERSION = "v1.13"
+APP_VERSION = "v1.14"
 ENGLISH_FONT_OPTIONS = ("Times New Roman", "Calibri")
 CHINESE_FONT_OPTIONS = ("楷体_GB2312", "宋体")
 DEFAULT_ENGLISH_FONT = "Times New Roman"
@@ -695,6 +695,24 @@ def iter_document_paragraphs(doc: Document):
 
 def paragraph_text(paragraph) -> str:
     return "".join(run.text for run in paragraph.runs)
+
+
+def xml_paragraph_text(xml_paragraph) -> str:
+    return "".join(node.text or "" for node in xml_paragraph.xpath(".//w:t"))
+
+
+def rewrite_xml_paragraph_text(xml_paragraph, text: str) -> None:
+    text_nodes = xml_paragraph.xpath(".//w:t")
+    if not text_nodes:
+        run = OxmlElement("w:r")
+        text_node = OxmlElement("w:t")
+        run.append(text_node)
+        xml_paragraph.append(run)
+        text_nodes = [text_node]
+    text_nodes[0].text = text
+    text_nodes[0].set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+    for node in text_nodes[1:]:
+        node.text = ""
 
 
 def paragraph_meta(paragraph) -> dict:
@@ -1673,15 +1691,56 @@ def normalize_final_cleanup_text(text: str) -> str:
 
 def collect_cjk_document_paragraphs(doc: Document) -> list[dict]:
     items = []
+    seen_xml_paragraphs = set()
     for index, paragraph in enumerate(iter_document_paragraphs(doc)):
+        seen_xml_paragraphs.add(id(paragraph._p))
         text = paragraph_text(paragraph)
         if cjk_count(text):
             items.append(
                 {
                     "id": index,
+                    "display_id": f"doc:{index}",
                     "paragraph": paragraph,
+                    "xml_paragraph": None,
                     "text": text,
                     "style": paragraph.style.name if paragraph.style else "",
+                }
+            )
+            continue
+        xml_text = xml_paragraph_text(paragraph._p)
+        if cjk_count(xml_text):
+            items.append(
+                {
+                    "id": index,
+                    "display_id": f"doc-xml:{index}",
+                    "paragraph": None,
+                    "xml_paragraph": paragraph._p,
+                    "text": xml_text,
+                    "style": paragraph.style.name if paragraph.style else "",
+                }
+            )
+    next_id = len(seen_xml_paragraphs)
+    for part in doc.part.package.parts:
+        partname = str(part.partname)
+        if not (partname.startswith("/word/header") or partname.startswith("/word/footer")):
+            continue
+        element = getattr(part, "element", None)
+        if element is None:
+            continue
+        for xml_index, xml_paragraph in enumerate(element.xpath(".//w:p")):
+            text = xml_paragraph_text(xml_paragraph)
+            if not cjk_count(text):
+                continue
+            item_id = next_id
+            next_id += 1
+            items.append(
+                {
+                    "id": item_id,
+                    "display_id": f"{partname}:{xml_index}",
+                    "paragraph": None,
+                    "xml_paragraph": xml_paragraph,
+                    "text": text,
+                    "style": partname,
                 }
             )
     return items
@@ -1790,7 +1849,12 @@ def cleanup_remaining_cjk_in_document(
                     continue
                 if cjk_count(new_text) and cjk_count(new_text) >= cjk_count(old_text):
                     continue
-                rewrite_paragraph(item["paragraph"], new_text, [], english_font, chinese_font)
+                if item.get("paragraph") is not None:
+                    rewrite_paragraph(item["paragraph"], new_text, [], english_font, chinese_font)
+                elif item.get("xml_paragraph") is not None:
+                    rewrite_xml_paragraph_text(item["xml_paragraph"], new_text)
+                else:
+                    continue
                 cleaned_ids.add(item_id)
                 changed = True
         if not changed:
@@ -2147,7 +2211,7 @@ def translate_docx_hybrid(
                 checklist.append(
                     {
                         "status": "HAS_CHINESE_IN_FINAL_DOC",
-                        "block_id": f"doc:{item['id']}",
+                        "block_id": item.get("display_id", f"doc:{item['id']}"),
                         "source_text": compact_text(item.get("text", ""), 120),
                         "style": item.get("style", ""),
                         "target_text": "",
@@ -2165,7 +2229,7 @@ def translate_docx_hybrid(
                 checklist.append(
                     {
                         "status": "HAS_CHINESE_IN_FINAL_DOC",
-                        "block_id": f"doc:{item['id']}",
+                        "block_id": item.get("display_id", f"doc:{item['id']}"),
                         "source_text": compact_text(item.get("text", ""), 120),
                         "style": item.get("style", ""),
                         "target_text": "",
