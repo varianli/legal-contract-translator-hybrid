@@ -8,7 +8,7 @@ from copy import copy
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
-from tkinter import BOTH, END, LEFT, RIGHT, X, BooleanVar, Button, Canvas, Checkbutton, Entry, Frame, Label, OptionMenu, Scrollbar, StringVar, Text, Tk, filedialog, messagebox
+from tkinter import BOTH, END, LEFT, RIGHT, X, BooleanVar, Button, Canvas, Checkbutton, Entry, Frame, Label, Listbox, OptionMenu, Scrollbar, StringVar, Text, Tk, filedialog, messagebox
 from tkinter.ttk import Progressbar
 
 from docx import Document
@@ -34,7 +34,7 @@ PROVIDER_DEFAULTS = {
     "OpenAI": {"base_url": "", "model": "gpt-4.1", "key_label": "OpenAI API Key"},
     "DeepSeek": {"base_url": "https://api.deepseek.com", "model": "deepseek-v4-flash", "key_label": "DeepSeek API Key"},
 }
-APP_VERSION = "v1.17"
+APP_VERSION = "v1.18"
 ENGLISH_FONT_OPTIONS = ("Times New Roman", "Calibri")
 CHINESE_FONT_OPTIONS = ("楷体_GB2312", "宋体")
 DEFAULT_ENGLISH_FONT = "Times New Roman"
@@ -2349,12 +2349,14 @@ class HybridApp:
         row.pack(fill=X, pady=(4, 8))
         self.add_file_button = Button(row, text="添加文件", command=self.choose_file, width=12)
         self.add_file_button.pack(side=LEFT)
+        self.remove_file_button = Button(row, text="删除选中", command=self.remove_selected_files, width=12)
+        self.remove_file_button.pack(side=LEFT, padx=(8, 0))
         self.clear_files_button = Button(row, text="清空列表", command=self.clear_files, width=12)
         self.clear_files_button.pack(side=LEFT, padx=(8, 0))
-        self.file_list_box = Text(file_frame, height=5, wrap="none")
+        self.file_list_box = Listbox(file_frame, height=5, selectmode="extended", exportselection=False)
         self.file_list_box.pack(fill=X, pady=(0, 8))
-        self.file_list_box.insert(END, "尚未选择文件。可以多次点击“添加文件”，也可以一次选择多个 .docx。")
-        self.file_list_box.config(state="disabled")
+        self.file_list_box.bind("<Delete>", lambda _event: self.remove_selected_files())
+        self.refresh_file_list()
         Label(file_frame, text="输出目录").pack(anchor="w")
         out_row = Frame(file_frame)
         out_row.pack(fill=X, pady=(4, 0))
@@ -2432,14 +2434,12 @@ class HybridApp:
             self.log(f"已跳过非 .docx 或不存在的文件：{path}")
 
     def refresh_file_list(self) -> None:
-        self.file_list_box.config(state="normal")
-        self.file_list_box.delete("1.0", END)
+        self.file_list_box.delete(0, END)
         if not self.file_paths:
             self.file_list_box.insert(END, "尚未选择文件。可以多次点击“添加文件”，也可以一次选择多个 .docx。")
         else:
             for index, path in enumerate(self.file_paths, start=1):
-                self.file_list_box.insert(END, f"{index}. {path}\n")
-        self.file_list_box.config(state="disabled")
+                self.file_list_box.insert(END, f"{index}. {path}")
 
     def choose_file(self):
         paths = filedialog.askopenfilenames(title="选择一个或多个 Word 合同", filetypes=[("Word 文档", "*.docx")])
@@ -2453,6 +2453,24 @@ class HybridApp:
         self.file_paths = []
         self.refresh_file_list()
         self.clear_job_rows()
+
+    def remove_selected_files(self):
+        if self.is_running:
+            messagebox.showerror("正在翻译", "翻译进行中不能删除文件。")
+            return
+        if not self.file_paths:
+            return
+        selected = list(self.file_list_box.curselection())
+        if not selected:
+            messagebox.showerror("未选中文件", "请先在文件列表中选中要删除的文件。")
+            return
+        removed = []
+        for index in sorted(selected, reverse=True):
+            if 0 <= index < len(self.file_paths):
+                removed.append(self.file_paths.pop(index))
+        self.refresh_file_list()
+        if removed:
+            self.log("已删除文件：" + "；".join(path.name for path in reversed(removed)))
 
     def choose_output_dir(self):
         path = filedialog.askdirectory(title="选择输出目录", initialdir=self.output_dir.get() or str(OUTPUT_DIR))
@@ -2583,6 +2601,7 @@ class HybridApp:
         self.start_button.config(state="disabled")
         self.stop_button.config(state="normal")
         self.add_file_button.config(state="disabled")
+        self.remove_file_button.config(state="disabled")
         self.clear_files_button.config(state="disabled")
         for path in self.file_paths:
             job_id = self.file_key(path)
@@ -2681,6 +2700,7 @@ class HybridApp:
         self.start_button.config(state="normal")
         self.stop_button.config(state="disabled")
         self.add_file_button.config(state="normal")
+        self.remove_file_button.config(state="normal")
         self.clear_files_button.config(state="normal")
         completed = len([item for item in self.job_results if not item[2]])
         cancelled = len([item for item in self.job_results if item[2]])
