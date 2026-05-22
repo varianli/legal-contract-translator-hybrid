@@ -34,7 +34,7 @@ PROVIDER_DEFAULTS = {
     "OpenAI": {"base_url": "", "model": "gpt-4.1", "key_label": "OpenAI API Key"},
     "DeepSeek": {"base_url": "https://api.deepseek.com", "model": "deepseek-v4-flash", "key_label": "DeepSeek API Key"},
 }
-APP_VERSION = "v1.15"
+APP_VERSION = "v1.16"
 ENGLISH_FONT_OPTIONS = ("Times New Roman", "Calibri")
 CHINESE_FONT_OPTIONS = ("楷体_GB2312", "宋体")
 DEFAULT_ENGLISH_FONT = "Times New Roman"

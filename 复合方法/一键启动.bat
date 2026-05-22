@@ -7,14 +7,9 @@ set "PARENT_VENV=%~dp0..\.venv\Scripts\python.exe"
 set "PYTHON_EXE="
 set "PYTHON_ARGS="
 
-if exist "%PARENT_VENV%" (
-  set "PYTHON_EXE=%PARENT_VENV%"
-  goto have_python
-)
-py -3.12 --version >nul 2>nul
+python --version >nul 2>nul
 if not errorlevel 1 (
-  set "PYTHON_EXE=py"
-  set "PYTHON_ARGS=-3.12"
+  set "PYTHON_EXE=python"
   goto have_python
 )
 py -3 --version >nul 2>nul
@@ -23,9 +18,13 @@ if not errorlevel 1 (
   set "PYTHON_ARGS=-3"
   goto have_python
 )
-python --version >nul 2>nul
+py --version >nul 2>nul
 if not errorlevel 1 (
-  set "PYTHON_EXE=python"
+  set "PYTHON_EXE=py"
+  goto have_python
+)
+if exist "%PARENT_VENV%" (
+  set "PYTHON_EXE=%PARENT_VENV%"
   goto have_python
 )
 
@@ -38,10 +37,9 @@ if errorlevel 1 goto python_manual_install
 winget install --id Python.Python.3.12 --source winget --exact --accept-package-agreements --accept-source-agreements
 if errorlevel 1 goto python_manual_install
 
-py -3.12 --version >nul 2>nul
+python --version >nul 2>nul
 if not errorlevel 1 (
-  set "PYTHON_EXE=py"
-  set "PYTHON_ARGS=-3.12"
+  set "PYTHON_EXE=python"
   goto have_python
 )
 py -3 --version >nul 2>nul
@@ -50,9 +48,9 @@ if not errorlevel 1 (
   set "PYTHON_ARGS=-3"
   goto have_python
 )
-python --version >nul 2>nul
+py --version >nul 2>nul
 if not errorlevel 1 (
-  set "PYTHON_EXE=python"
+  set "PYTHON_EXE=py"
   goto have_python
 )
 
