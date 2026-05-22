@@ -11,6 +11,12 @@ if exist "%PARENT_VENV%" (
   set "PYTHON_EXE=%PARENT_VENV%"
   goto have_python
 )
+py -3.12 --version >nul 2>nul
+if not errorlevel 1 (
+  set "PYTHON_EXE=py"
+  set "PYTHON_ARGS=-3.12"
+  goto have_python
+)
 py -3 --version >nul 2>nul
 if not errorlevel 1 (
   set "PYTHON_EXE=py"
@@ -29,9 +35,15 @@ echo Trying to install Python 3.12 automatically with winget...
 winget --version >nul 2>nul
 if errorlevel 1 goto python_manual_install
 
-winget install -e --id Python.Python.3.12 --accept-package-agreements --accept-source-agreements
+winget install --id Python.Python.3.12 --source winget --exact --accept-package-agreements --accept-source-agreements
 if errorlevel 1 goto python_manual_install
 
+py -3.12 --version >nul 2>nul
+if not errorlevel 1 (
+  set "PYTHON_EXE=py"
+  set "PYTHON_ARGS=-3.12"
+  goto have_python
+)
 py -3 --version >nul 2>nul
 if not errorlevel 1 (
   set "PYTHON_EXE=py"

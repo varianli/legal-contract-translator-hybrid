@@ -8,7 +8,7 @@ from copy import copy
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
-from tkinter import BOTH, END, LEFT, RIGHT, X, BooleanVar, Button, Checkbutton, Entry, Frame, Label, OptionMenu, StringVar, Text, Tk, filedialog, messagebox
+from tkinter import BOTH, END, LEFT, RIGHT, X, BooleanVar, Button, Canvas, Checkbutton, Entry, Frame, Label, OptionMenu, Scrollbar, StringVar, Text, Tk, filedialog, messagebox
 from tkinter.ttk import Progressbar
 
 from docx import Document
@@ -34,7 +34,7 @@ PROVIDER_DEFAULTS = {
     "OpenAI": {"base_url": "", "model": "gpt-4.1", "key_label": "OpenAI API Key"},
     "DeepSeek": {"base_url": "https://api.deepseek.com", "model": "deepseek-v4-flash", "key_label": "DeepSeek API Key"},
 }
-APP_VERSION = "v1.14"
+APP_VERSION = "v1.15"
 ENGLISH_FONT_OPTIONS = ("Times New Roman", "Calibri")
 CHINESE_FONT_OPTIONS = ("楷体_GB2312", "宋体")
 DEFAULT_ENGLISH_FONT = "Times New Roman"
@@ -2303,7 +2303,18 @@ class HybridApp:
         self.remember_key = BooleanVar(value=bool(config.get("api_key")))
         self.cancel_event = threading.Event()
 
-        top = Frame(root, padx=16, pady=12)
+        self.canvas = Canvas(root, highlightthickness=0)
+        self.page_scrollbar = Scrollbar(root, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.page_scrollbar.set)
+        self.page_scrollbar.pack(side=RIGHT, fill="y")
+        self.canvas.pack(side=LEFT, fill=BOTH, expand=True)
+        self.content = Frame(self.canvas)
+        self.content_window = self.canvas.create_window((0, 0), window=self.content, anchor="nw")
+        self.content.bind("<Configure>", self.on_content_configure)
+        self.canvas.bind("<Configure>", self.on_canvas_configure)
+        self.canvas.bind_all("<MouseWheel>", self.on_mousewheel)
+
+        top = Frame(self.content, padx=16, pady=12)
         top.pack(fill=X)
         Label(top, text="API 类型").pack(anchor="w")
         OptionMenu(top, self.provider, *PROVIDER_DEFAULTS.keys(), command=self.on_provider_change).pack(fill=X, pady=(4, 8))
@@ -2326,7 +2337,7 @@ class HybridApp:
         OptionMenu(right_font, self.chinese_font, *CHINESE_FONT_OPTIONS).pack(fill=X, pady=(4, 0))
         Checkbutton(top, text="记住 API Key（明文保存在本机复合方法目录）", variable=self.remember_key).pack(anchor="w")
 
-        file_frame = Frame(root, padx=16, pady=8)
+        file_frame = Frame(self.content, padx=16, pady=8)
         file_frame.pack(fill=X)
         Label(file_frame, text="合同文件（.docx）").pack(anchor="w")
         row = Frame(file_frame)
@@ -2339,13 +2350,13 @@ class HybridApp:
         Entry(out_row, textvariable=self.output_dir).pack(side=LEFT, fill=X, expand=True)
         Button(out_row, text="选择目录", command=self.choose_output_dir, width=12).pack(side=RIGHT, padx=(8, 0))
 
-        self.drop_label = Label(root, text="把 Word 合同拖到这里\n输出：DOCX + source Markdown + translated Markdown + checklist + JSON", relief="groove", height=4)
+        self.drop_label = Label(self.content, text="把 Word 合同拖到这里\n输出：DOCX + source Markdown + translated Markdown + checklist + JSON", relief="groove", height=4)
         self.drop_label.pack(fill=X, padx=16, pady=8)
         if DND_AVAILABLE:
             self.drop_label.drop_target_register(DND_FILES)
             self.drop_label.dnd_bind("<<Drop>>", self.on_drop)
 
-        progress_frame = Frame(root, padx=16, pady=8)
+        progress_frame = Frame(self.content, padx=16, pady=8)
         progress_frame.pack(fill=X)
         self.translation_progress_text = StringVar(value="翻译进度：0/100（0.0%）")
         self.translation_current_text = StringVar(value="翻译：尚未开始")
@@ -2360,16 +2371,26 @@ class HybridApp:
         self.review_bar.pack(fill=X, pady=(4, 4))
         Label(progress_frame, textvariable=self.review_current_text, wraplength=820, justify=LEFT).pack(anchor="w")
 
-        action = Frame(root, padx=16, pady=8)
+        action = Frame(self.content, padx=16, pady=8)
         action.pack(fill=X)
         self.start_button = Button(action, text="开始复合方法翻译", command=self.start, height=2)
         self.start_button.pack(side=LEFT, fill=X, expand=True)
         self.stop_button = Button(action, text="中止并导出当前进度", command=self.request_cancel, height=2, state="disabled")
         self.stop_button.pack(side=RIGHT, padx=(8, 0))
 
-        self.log_box = Text(root, height=14, wrap="word")
+        self.log_box = Text(self.content, height=14, wrap="word")
         self.log_box.pack(fill=BOTH, expand=True, padx=16, pady=(4, 16))
         self.log(f"{APP_VERSION} 复合方法：Markdown 负责结构和上下文，run 结构负责格式抽取，模型负责格式片段到英文短语的映射。")
+
+    def on_content_configure(self, _event=None):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def on_canvas_configure(self, event):
+        self.canvas.itemconfigure(self.content_window, width=event.width)
+
+    def on_mousewheel(self, event):
+        if event.delta:
+            self.canvas.yview_scroll(int(-event.delta / 120), "units")
 
     def on_provider_change(self, provider):
         defaults = PROVIDER_DEFAULTS[provider]
