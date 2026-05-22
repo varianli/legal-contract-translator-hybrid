@@ -7,7 +7,7 @@ from tkinter import filedialog, messagebox, ttk
 import hybrid_markdown_run_translator as core
 
 
-MAC_APP_VERSION = "v1.27-mac"
+MAC_APP_VERSION = "v1.28-mac"
 
 
 def friendly_error(exc: Exception) -> str:
@@ -165,6 +165,7 @@ class MacHybridApp:
         log_scroll = ttk.Scrollbar(log_outer, orient="vertical", command=self.log_box.yview)
         log_scroll.grid(row=0, column=1, sticky="ns")
         self.log_box.configure(yscrollcommand=log_scroll.set)
+        self.bind_widget_scrolls(self.content)
 
     def on_content_configure(self, _event=None) -> None:
         self.page_canvas.configure(scrollregion=self.page_canvas.bbox("all"))
@@ -177,9 +178,14 @@ class MacHybridApp:
         self.root.bind_all("<Button-4>", self.on_page_mousewheel, add="+")
         self.root.bind_all("<Button-5>", self.on_page_mousewheel, add="+")
 
+    def bind_widget_scrolls(self, widget) -> None:
+        widget.bind("<MouseWheel>", self.on_page_mousewheel, add="+")
+        widget.bind("<Button-4>", self.on_page_mousewheel, add="+")
+        widget.bind("<Button-5>", self.on_page_mousewheel, add="+")
+        for child in widget.winfo_children():
+            self.bind_widget_scrolls(child)
+
     def on_page_mousewheel(self, event):
-        if event.widget is self.log_box:
-            return
         if getattr(event, "num", None) == 4:
             units = -3
         elif getattr(event, "num", None) == 5:
@@ -188,7 +194,13 @@ class MacHybridApp:
             delta = getattr(event, "delta", 0)
             if delta == 0:
                 return
-            units = -3 if delta > 0 else 3
+            if abs(delta) >= 120:
+                units = -int(delta / 120) * 3
+            else:
+                units = -int(delta) * 3
+            if units == 0:
+                units = -3 if delta > 0 else 3
+            units = max(-12, min(12, units))
         self.page_canvas.yview_scroll(units, "units")
         return "break"
 
@@ -310,6 +322,7 @@ class MacHybridApp:
             "review_bar": review_bar,
             "current_text": current_text,
         }
+        self.bind_widget_scrolls(row)
 
     def test_api_key(self) -> None:
         provider, api_key, base_url, model = self.get_api_values()
