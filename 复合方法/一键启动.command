@@ -52,10 +52,15 @@ if [ ! -x ".venv/bin/python" ]; then
   fi
 fi
 
+REQ_FILE="requirements_mac.txt"
+if [ ! -f "$REQ_FILE" ]; then
+  REQ_FILE="requirements.txt"
+fi
+
 echo "Installing/checking dependencies..."
 ".venv/bin/python" -m ensurepip --upgrade >/dev/null 2>&1 || true
 ".venv/bin/python" -m pip install --upgrade pip
-".venv/bin/python" -m pip install -r requirements.txt
+".venv/bin/python" -m pip install -r "$REQ_FILE"
 if [ $? -ne 0 ]; then
   echo
   echo "Dependency installation failed."
@@ -66,10 +71,10 @@ if [ $? -ne 0 ]; then
 fi
 
 if [ "${1:-}" = "--check" ]; then
-  ".venv/bin/python" -c "import openai, docx, tkinterdnd2; print('Dependency import check passed.')"
+  ".venv/bin/python" -c "import openai, docx; print('Mac dependency import check passed.')"
   exit $?
 fi
 
-".venv/bin/python" hybrid_markdown_run_translator.py
+".venv/bin/python" hybrid_markdown_run_translator_mac.py
 echo
 read -r -p "Press Enter to close..."
