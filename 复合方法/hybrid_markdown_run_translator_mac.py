@@ -7,7 +7,7 @@ from tkinter import filedialog, messagebox, ttk
 import hybrid_markdown_run_translator as core
 
 
-MAC_APP_VERSION = "v1.26-mac"
+MAC_APP_VERSION = "v1.27-mac"
 
 
 def friendly_error(exc: Exception) -> str:
@@ -55,9 +55,22 @@ class MacHybridApp:
 
     def build_ui(self, defaults: dict, config: dict) -> None:
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(4, weight=1)
+        self.root.rowconfigure(0, weight=1)
 
-        api = ttk.LabelFrame(self.root, text="API 设置", padding=12)
+        self.page_canvas = tk.Canvas(self.root, highlightthickness=0)
+        self.page_scrollbar = ttk.Scrollbar(self.root, orient="vertical", command=self.page_canvas.yview)
+        self.page_canvas.configure(yscrollcommand=self.page_scrollbar.set)
+        self.page_canvas.grid(row=0, column=0, sticky="nsew")
+        self.page_scrollbar.grid(row=0, column=1, sticky="ns")
+
+        self.content = ttk.Frame(self.page_canvas)
+        self.content_window = self.page_canvas.create_window((0, 0), window=self.content, anchor="nw")
+        self.content.columnconfigure(0, weight=1)
+        self.content.bind("<Configure>", self.on_content_configure)
+        self.page_canvas.bind("<Configure>", self.on_page_canvas_configure)
+        self.bind_page_scroll()
+
+        api = ttk.LabelFrame(self.content, text="API 设置", padding=12)
         api.grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 8))
         api.columnconfigure(1, weight=1)
 
@@ -97,7 +110,7 @@ class MacHybridApp:
         ttk.Checkbutton(key_row, text="记住 API Key（明文保存在本机目录）", variable=self.remember_key).pack(side="left")
         ttk.Button(key_row, text="测试 API Key", command=self.test_api_key).pack(side="right")
 
-        files = ttk.LabelFrame(self.root, text="文件与输出", padding=12)
+        files = ttk.LabelFrame(self.content, text="文件与输出", padding=12)
         files.grid(row=1, column=0, sticky="ew", padx=14, pady=8)
         files.columnconfigure(0, weight=1)
         file_buttons = ttk.Frame(files)
@@ -120,7 +133,7 @@ class MacHybridApp:
         self.output_dir_entry.insert(0, str(core.OUTPUT_DIR))
         ttk.Button(output_row, text="选择目录", command=self.choose_output_dir).grid(row=0, column=2, padx=(8, 0))
 
-        actions = ttk.Frame(self.root, padding=(14, 4))
+        actions = ttk.Frame(self.content, padding=(14, 4))
         actions.grid(row=2, column=0, sticky="ew")
         actions.columnconfigure(0, weight=1)
         self.start_button = ttk.Button(actions, text="开始翻译所选文件", command=self.start)
@@ -128,7 +141,7 @@ class MacHybridApp:
         self.stop_button = ttk.Button(actions, text="全部中止并导出当前进度", command=self.request_cancel_all, state="disabled")
         self.stop_button.grid(row=0, column=1, padx=(8, 0))
 
-        progress_outer = ttk.LabelFrame(self.root, text="文件进度", padding=10)
+        progress_outer = ttk.LabelFrame(self.content, text="文件进度", padding=10)
         progress_outer.grid(row=3, column=0, sticky="nsew", padx=14, pady=8)
         progress_outer.columnconfigure(0, weight=1)
         self.jobs_canvas = tk.Canvas(progress_outer, height=230, highlightthickness=0)
@@ -143,7 +156,7 @@ class MacHybridApp:
         self.empty_jobs_label = ttk.Label(self.jobs_frame, text="开始后会在这里显示每个文件的翻译进度和复核进度。")
         self.empty_jobs_label.pack(anchor="w", pady=8)
 
-        log_outer = ttk.LabelFrame(self.root, text="日志", padding=8)
+        log_outer = ttk.LabelFrame(self.content, text="日志", padding=8)
         log_outer.grid(row=4, column=0, sticky="nsew", padx=14, pady=(8, 14))
         log_outer.columnconfigure(0, weight=1)
         log_outer.rowconfigure(0, weight=1)
@@ -152,6 +165,32 @@ class MacHybridApp:
         log_scroll = ttk.Scrollbar(log_outer, orient="vertical", command=self.log_box.yview)
         log_scroll.grid(row=0, column=1, sticky="ns")
         self.log_box.configure(yscrollcommand=log_scroll.set)
+
+    def on_content_configure(self, _event=None) -> None:
+        self.page_canvas.configure(scrollregion=self.page_canvas.bbox("all"))
+
+    def on_page_canvas_configure(self, event) -> None:
+        self.page_canvas.itemconfigure(self.content_window, width=event.width)
+
+    def bind_page_scroll(self) -> None:
+        self.root.bind_all("<MouseWheel>", self.on_page_mousewheel, add="+")
+        self.root.bind_all("<Button-4>", self.on_page_mousewheel, add="+")
+        self.root.bind_all("<Button-5>", self.on_page_mousewheel, add="+")
+
+    def on_page_mousewheel(self, event):
+        if event.widget is self.log_box:
+            return
+        if getattr(event, "num", None) == 4:
+            units = -3
+        elif getattr(event, "num", None) == 5:
+            units = 3
+        else:
+            delta = getattr(event, "delta", 0)
+            if delta == 0:
+                return
+            units = -3 if delta > 0 else 3
+        self.page_canvas.yview_scroll(units, "units")
+        return "break"
 
     def get_api_values(self) -> tuple[str, str, str, str]:
         provider = self.provider.get().strip() or "DeepSeek"
