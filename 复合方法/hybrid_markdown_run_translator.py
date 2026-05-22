@@ -34,7 +34,7 @@ PROVIDER_DEFAULTS = {
     "OpenAI": {"base_url": "", "model": "gpt-4.1", "key_label": "OpenAI API Key"},
     "DeepSeek": {"base_url": "https://api.deepseek.com", "model": "deepseek-v4-flash", "key_label": "DeepSeek API Key"},
 }
-APP_VERSION = "v1.16"
+APP_VERSION = "v1.17"
 ENGLISH_FONT_OPTIONS = ("Times New Roman", "Calibri")
 CHINESE_FONT_OPTIONS = ("楷体_GB2312", "宋体")
 DEFAULT_ENGLISH_FONT = "Times New Roman"
@@ -2298,10 +2298,15 @@ class HybridApp:
         self.model = StringVar(value=config.get("model", defaults["model"]))
         self.english_font = StringVar(value=valid_english_font(config.get("english_font", DEFAULT_ENGLISH_FONT)))
         self.chinese_font = StringVar(value=valid_chinese_font(config.get("chinese_font", DEFAULT_CHINESE_FONT)))
-        self.file_path = StringVar(value="")
         self.output_dir = StringVar(value=str(OUTPUT_DIR))
         self.remember_key = BooleanVar(value=bool(config.get("api_key")))
-        self.cancel_event = threading.Event()
+        self.file_paths: list[Path] = []
+        self.job_widgets: dict[str, dict] = {}
+        self.job_cancel_events: dict[str, threading.Event] = {}
+        self.job_results: list[tuple[Path, tuple, bool]] = []
+        self.job_errors: list[tuple[Path, str]] = []
+        self.active_jobs = 0
+        self.is_running = False
 
         self.canvas = Canvas(root, highlightthickness=0)
         self.page_scrollbar = Scrollbar(root, orient="vertical", command=self.canvas.yview)
@@ -2339,18 +2344,24 @@ class HybridApp:
 
         file_frame = Frame(self.content, padx=16, pady=8)
         file_frame.pack(fill=X)
-        Label(file_frame, text="合同文件（.docx）").pack(anchor="w")
+        Label(file_frame, text="合同文件（.docx，可多次添加/一次多选）").pack(anchor="w")
         row = Frame(file_frame)
         row.pack(fill=X, pady=(4, 8))
-        Entry(row, textvariable=self.file_path).pack(side=LEFT, fill=X, expand=True)
-        Button(row, text="选择文件", command=self.choose_file, width=12).pack(side=RIGHT, padx=(8, 0))
+        self.add_file_button = Button(row, text="添加文件", command=self.choose_file, width=12)
+        self.add_file_button.pack(side=LEFT)
+        self.clear_files_button = Button(row, text="清空列表", command=self.clear_files, width=12)
+        self.clear_files_button.pack(side=LEFT, padx=(8, 0))
+        self.file_list_box = Text(file_frame, height=5, wrap="none")
+        self.file_list_box.pack(fill=X, pady=(0, 8))
+        self.file_list_box.insert(END, "尚未选择文件。可以多次点击“添加文件”，也可以一次选择多个 .docx。")
+        self.file_list_box.config(state="disabled")
         Label(file_frame, text="输出目录").pack(anchor="w")
         out_row = Frame(file_frame)
         out_row.pack(fill=X, pady=(4, 0))
         Entry(out_row, textvariable=self.output_dir).pack(side=LEFT, fill=X, expand=True)
         Button(out_row, text="选择目录", command=self.choose_output_dir, width=12).pack(side=RIGHT, padx=(8, 0))
 
-        self.drop_label = Label(self.content, text="把 Word 合同拖到这里\n输出：DOCX + source Markdown + translated Markdown + checklist + JSON", relief="groove", height=4)
+        self.drop_label = Label(self.content, text="把一个或多个 Word 合同拖到这里\n每个文件单独显示翻译/复核进度，并各自输出 Word 与过程文件", relief="groove", height=4)
         self.drop_label.pack(fill=X, padx=16, pady=8)
         if DND_AVAILABLE:
             self.drop_label.drop_target_register(DND_FILES)
@@ -2358,24 +2369,17 @@ class HybridApp:
 
         progress_frame = Frame(self.content, padx=16, pady=8)
         progress_frame.pack(fill=X)
-        self.translation_progress_text = StringVar(value="翻译进度：0/100（0.0%）")
-        self.translation_current_text = StringVar(value="翻译：尚未开始")
-        self.review_progress_text = StringVar(value="复核检查：0/100（0.0%）")
-        self.review_current_text = StringVar(value="复核：等待翻译完成")
-        Label(progress_frame, textvariable=self.translation_progress_text).pack(anchor="w")
-        self.translation_bar = Progressbar(progress_frame, maximum=100)
-        self.translation_bar.pack(fill=X, pady=(4, 4))
-        Label(progress_frame, textvariable=self.translation_current_text, wraplength=820, justify=LEFT).pack(anchor="w")
-        Label(progress_frame, textvariable=self.review_progress_text).pack(anchor="w", pady=(8, 0))
-        self.review_bar = Progressbar(progress_frame, maximum=100)
-        self.review_bar.pack(fill=X, pady=(4, 4))
-        Label(progress_frame, textvariable=self.review_current_text, wraplength=820, justify=LEFT).pack(anchor="w")
+        Label(progress_frame, text="文件进度").pack(anchor="w")
+        self.jobs_frame = Frame(progress_frame)
+        self.jobs_frame.pack(fill=X, pady=(4, 0))
+        self.empty_jobs_label = Label(self.jobs_frame, text="开始后会在这里显示每个文件的独立进度。", anchor="w")
+        self.empty_jobs_label.pack(fill=X)
 
         action = Frame(self.content, padx=16, pady=8)
         action.pack(fill=X)
-        self.start_button = Button(action, text="开始复合方法翻译", command=self.start, height=2)
+        self.start_button = Button(action, text="开始翻译所选文件", command=self.start, height=2)
         self.start_button.pack(side=LEFT, fill=X, expand=True)
-        self.stop_button = Button(action, text="中止并导出当前进度", command=self.request_cancel, height=2, state="disabled")
+        self.stop_button = Button(action, text="全部中止并导出当前进度", command=self.request_cancel, height=2, state="disabled")
         self.stop_button.pack(side=RIGHT, padx=(8, 0))
 
         self.log_box = Text(self.content, height=14, wrap="word")
@@ -2398,10 +2402,57 @@ class HybridApp:
         self.base_url.set(defaults["base_url"])
         self.model.set(defaults["model"])
 
+    def file_key(self, path: Path) -> str:
+        try:
+            return str(path.resolve()).lower()
+        except OSError:
+            return str(path).lower()
+
+    def add_files(self, paths) -> None:
+        if self.is_running:
+            messagebox.showerror("正在翻译", "翻译进行中不能添加文件。")
+            return
+        existing = {self.file_key(path) for path in self.file_paths}
+        added = 0
+        skipped = []
+        for raw_path in paths:
+            path = Path(str(raw_path).strip().strip('"'))
+            if path.exists() and path.suffix.lower() == ".docx":
+                key = self.file_key(path)
+                if key not in existing:
+                    self.file_paths.append(path)
+                    existing.add(key)
+                    added += 1
+                continue
+            skipped.append(str(path))
+        self.refresh_file_list()
+        if added:
+            self.log(f"已添加 {added} 个 Word 文件。")
+        for path in skipped[:5]:
+            self.log(f"已跳过非 .docx 或不存在的文件：{path}")
+
+    def refresh_file_list(self) -> None:
+        self.file_list_box.config(state="normal")
+        self.file_list_box.delete("1.0", END)
+        if not self.file_paths:
+            self.file_list_box.insert(END, "尚未选择文件。可以多次点击“添加文件”，也可以一次选择多个 .docx。")
+        else:
+            for index, path in enumerate(self.file_paths, start=1):
+                self.file_list_box.insert(END, f"{index}. {path}\n")
+        self.file_list_box.config(state="disabled")
+
     def choose_file(self):
-        path = filedialog.askopenfilename(title="选择 Word 合同", filetypes=[("Word 文档", "*.docx")])
-        if path:
-            self.file_path.set(path)
+        paths = filedialog.askopenfilenames(title="选择一个或多个 Word 合同", filetypes=[("Word 文档", "*.docx")])
+        if paths:
+            self.add_files(paths)
+
+    def clear_files(self):
+        if self.is_running:
+            messagebox.showerror("正在翻译", "翻译进行中不能清空文件列表。")
+            return
+        self.file_paths = []
+        self.refresh_file_list()
+        self.clear_job_rows()
 
     def choose_output_dir(self):
         path = filedialog.askdirectory(title="选择输出目录", initialdir=self.output_dir.get() or str(OUTPUT_DIR))
@@ -2411,7 +2462,52 @@ class HybridApp:
     def on_drop(self, event):
         paths = self.root.tk.splitlist(event.data)
         if paths:
-            self.file_path.set(paths[0])
+            self.add_files(paths)
+
+    def clear_job_rows(self):
+        for child in self.jobs_frame.winfo_children():
+            child.destroy()
+        self.job_widgets = {}
+        self.empty_jobs_label = Label(self.jobs_frame, text="开始后会在这里显示每个文件的独立进度。", anchor="w")
+        self.empty_jobs_label.pack(fill=X)
+
+    def create_job_row(self, job_id: str, path: Path):
+        if self.empty_jobs_label and self.empty_jobs_label.winfo_exists():
+            self.empty_jobs_label.destroy()
+        frame = Frame(self.jobs_frame, relief="groove", borderwidth=1, padx=8, pady=6)
+        frame.pack(fill=X, pady=(0, 8))
+        title_row = Frame(frame)
+        title_row.pack(fill=X)
+        Label(title_row, text=path.name, anchor="w", font=("TkDefaultFont", 10, "bold")).pack(side=LEFT, fill=X, expand=True)
+        cancel_button = Button(title_row, text="中止此文件", command=lambda key=job_id: self.request_cancel_job(key), width=12)
+        cancel_button.pack(side=RIGHT, padx=(8, 0))
+        path_text = StringVar(value=str(path))
+        Label(frame, textvariable=path_text, anchor="w", wraplength=800, justify=LEFT).pack(fill=X, pady=(2, 4))
+        translation_text = StringVar(value="翻译进度：0/100（0.0%）")
+        translation_current = StringVar(value="翻译：等待开始")
+        review_text = StringVar(value="复核检查：0/100（0.0%）")
+        review_current = StringVar(value="复核：等待翻译完成")
+        status_text = StringVar(value="状态：排队中")
+        Label(frame, textvariable=translation_text).pack(anchor="w")
+        translation_bar = Progressbar(frame, maximum=100)
+        translation_bar.pack(fill=X, pady=(2, 3))
+        Label(frame, textvariable=translation_current, wraplength=820, justify=LEFT).pack(anchor="w")
+        Label(frame, textvariable=review_text).pack(anchor="w", pady=(6, 0))
+        review_bar = Progressbar(frame, maximum=100)
+        review_bar.pack(fill=X, pady=(2, 3))
+        Label(frame, textvariable=review_current, wraplength=820, justify=LEFT).pack(anchor="w")
+        Label(frame, textvariable=status_text).pack(anchor="w", pady=(4, 0))
+        self.job_widgets[job_id] = {
+            "frame": frame,
+            "cancel_button": cancel_button,
+            "translation_text": translation_text,
+            "translation_current": translation_current,
+            "translation_bar": translation_bar,
+            "review_text": review_text,
+            "review_current": review_current,
+            "review_bar": review_bar,
+            "status_text": status_text,
+        }
 
     def log(self, text: str):
         if threading.get_ident() != self.main_thread_id:
@@ -2421,24 +2517,30 @@ class HybridApp:
         self.log_box.see(END)
         self.root.update_idletasks()
 
-    def update_translation_progress(self, done: int, total: int, current: str):
+    def update_job_translation_progress(self, job_id: str, done: int, total: int, current: str):
         if threading.get_ident() != self.main_thread_id:
-            self.root.after(0, self.update_translation_progress, done, total, current)
+            self.root.after(0, self.update_job_translation_progress, job_id, done, total, current)
+            return
+        widgets = self.job_widgets.get(job_id)
+        if not widgets:
             return
         percent = 0 if total <= 0 else max(0, min(100, done * 100 / total))
-        self.translation_bar["value"] = percent
-        self.translation_progress_text.set(f"翻译进度：{done}/{total}（{percent:.1f}%）")
-        self.translation_current_text.set(f"翻译：{current}")
+        widgets["translation_bar"]["value"] = percent
+        widgets["translation_text"].set(f"翻译进度：{done}/{total}（{percent:.1f}%）")
+        widgets["translation_current"].set(f"翻译：{current}")
         self.root.update_idletasks()
 
-    def update_review_progress(self, done: int, total: int, current: str):
+    def update_job_review_progress(self, job_id: str, done: int, total: int, current: str):
         if threading.get_ident() != self.main_thread_id:
-            self.root.after(0, self.update_review_progress, done, total, current)
+            self.root.after(0, self.update_job_review_progress, job_id, done, total, current)
+            return
+        widgets = self.job_widgets.get(job_id)
+        if not widgets:
             return
         percent = 0 if total <= 0 else max(0, min(100, done * 100 / total))
-        self.review_bar["value"] = percent
-        self.review_progress_text.set(f"复核检查：{done}/{total}（{percent:.1f}%）")
-        self.review_current_text.set(f"复核：{current}")
+        widgets["review_bar"]["value"] = percent
+        widgets["review_text"].set(f"复核检查：{done}/{total}（{percent:.1f}%）")
+        widgets["review_current"].set(f"复核：{current}")
         self.root.update_idletasks()
 
     def start(self):
@@ -2448,7 +2550,6 @@ class HybridApp:
         model = self.model.get().strip()
         english_font = valid_english_font(self.english_font.get().strip())
         chinese_font = valid_chinese_font(self.chinese_font.get().strip())
-        input_path = Path(self.file_path.get().strip().strip('"'))
         output_dir = Path(self.output_dir.get().strip().strip('"'))
         if not api_key:
             messagebox.showerror("缺少 API Key", f"请先输入 {provider} API Key。")
@@ -2456,8 +2557,12 @@ class HybridApp:
         if not model:
             messagebox.showerror("缺少模型", "请填写模型名称。")
             return
-        if not input_path.exists() or input_path.suffix.lower() != ".docx":
-            messagebox.showerror("文件不支持", "请选择存在的 .docx 文件。")
+        if not self.file_paths:
+            messagebox.showerror("缺少文件", "请先添加至少一个 .docx 文件。")
+            return
+        invalid = [path for path in self.file_paths if not path.exists() or path.suffix.lower() != ".docx"]
+        if invalid:
+            messagebox.showerror("文件不支持", "以下文件不存在或不是 .docx：\n" + "\n".join(str(path) for path in invalid[:10]))
             return
         if provider == "DeepSeek" and not base_url:
             base_url = PROVIDER_DEFAULTS["DeepSeek"]["base_url"]
@@ -2465,26 +2570,57 @@ class HybridApp:
         self.english_font.set(english_font)
         self.chinese_font.set(chinese_font)
         save_config(provider, api_key if self.remember_key.get() else "", base_url, model, english_font, chinese_font)
-        self.cancel_event.clear()
+        self.is_running = True
+        self.job_results = []
+        self.job_errors = []
+        self.job_cancel_events = {}
+        self.active_jobs = len(self.file_paths)
+        for child in self.jobs_frame.winfo_children():
+            child.destroy()
+        self.job_widgets = {}
+        for path in self.file_paths:
+            self.create_job_row(self.file_key(path), path)
         self.start_button.config(state="disabled")
         self.stop_button.config(state="normal")
-        self.update_translation_progress(0, PROGRESS_TOTAL, "准备开始")
-        self.update_review_progress(0, PROGRESS_TOTAL, "等待翻译完成")
-        thread = threading.Thread(
-            target=self.worker,
-            args=(input_path, output_dir, provider, api_key, base_url, model, english_font, chinese_font),
-            daemon=True,
-        )
-        thread.start()
+        self.add_file_button.config(state="disabled")
+        self.clear_files_button.config(state="disabled")
+        for path in self.file_paths:
+            job_id = self.file_key(path)
+            cancel_event = threading.Event()
+            self.job_cancel_events[job_id] = cancel_event
+            self.set_job_status(job_id, "状态：正在启动")
+            thread = threading.Thread(
+                target=self.worker,
+                args=(job_id, path, output_dir, provider, api_key, base_url, model, english_font, chinese_font, cancel_event),
+                daemon=True,
+            )
+            thread.start()
 
     def request_cancel(self):
-        self.cancel_event.set()
+        for job_id in list(self.job_cancel_events):
+            self.request_cancel_job(job_id, show_log=False)
         self.stop_button.config(state="disabled")
-        self.log("已请求中止；将不再等待当前 API 批次返回，直接导出最近已完成进度。")
-        self.update_review_progress(85, PROGRESS_TOTAL, "正在中止并导出最近已完成进度...")
+        self.log("已请求全部中止；每个正在运行的文件都会导出最近已完成进度。")
+
+    def request_cancel_job(self, job_id: str, show_log: bool = True):
+        cancel_event = self.job_cancel_events.get(job_id)
+        if cancel_event:
+            cancel_event.set()
+        widgets = self.job_widgets.get(job_id)
+        if widgets:
+            widgets["cancel_button"].config(state="disabled")
+            widgets["status_text"].set("状态：正在中止并导出当前进度")
+        if show_log:
+            self.log("已请求中止该文件；将导出最近已完成进度。")
+
+    def set_job_status(self, job_id: str, status: str):
+        widgets = self.job_widgets.get(job_id)
+        if widgets:
+            widgets["status_text"].set(status)
 
     def worker(
         self,
+        job_id: str,
         input_path: Path,
         output_dir: Path,
         provider: str,
@@ -2493,6 +2629,7 @@ class HybridApp:
         model: str,
         english_font: str,
         chinese_font: str,
+        cancel_event: threading.Event,
     ):
         try:
             paths = translate_docx_hybrid(
@@ -2505,35 +2642,60 @@ class HybridApp:
                 english_font,
                 chinese_font,
                 self.log,
-                self.update_translation_progress,
-                self.update_review_progress,
-                self.cancel_event,
+                lambda done, total, current: self.update_job_translation_progress(job_id, done, total, current),
+                lambda done, total, current: self.update_job_review_progress(job_id, done, total, current),
+                cancel_event,
             )
-            self.root.after(0, self.finish_success, paths[:-1], paths[-1])
+            self.root.after(0, self.finish_job_success, job_id, input_path, paths[:-1], paths[-1])
         except TranslationCancelled:
-            self.log("已中止；当前还没有完成可导出的翻译批次。")
-            self.root.after(0, self.finish_error, "已中止；当前还没有完成可导出的翻译批次。")
+            self.log(f"{input_path.name} 已中止；当前还没有完成可导出的翻译批次。")
+            self.root.after(0, self.finish_job_error, job_id, input_path, "已中止；当前还没有完成可导出的翻译批次。")
         except Exception as exc:
-            self.log("发生错误：")
+            self.log(f"{input_path.name} 发生错误：")
             self.log(str(exc))
             self.log(traceback.format_exc())
-            self.root.after(0, self.finish_error, str(exc))
+            self.root.after(0, self.finish_job_error, job_id, input_path, str(exc))
 
-    def finish_success(self, paths, cancelled: bool):
+    def finish_job_success(self, job_id: str, input_path: Path, paths, cancelled: bool):
+        widgets = self.job_widgets.get(job_id)
+        if widgets:
+            widgets["cancel_button"].config(state="disabled")
+            widgets["status_text"].set("状态：已中止并导出" if cancelled else "状态：已完成")
+        self.job_results.append((input_path, paths, cancelled))
+        self.finish_one_job()
+
+    def finish_job_error(self, job_id: str, input_path: Path, error: str):
+        widgets = self.job_widgets.get(job_id)
+        if widgets:
+            widgets["cancel_button"].config(state="disabled")
+            widgets["status_text"].set(f"状态：失败 - {compact_text(error, 120)}")
+        self.job_errors.append((input_path, error))
+        self.finish_one_job()
+
+    def finish_one_job(self):
+        self.active_jobs = max(0, self.active_jobs - 1)
+        if self.active_jobs:
+            return
+        self.is_running = False
+        self.job_cancel_events = {}
         self.start_button.config(state="normal")
         self.stop_button.config(state="disabled")
-        title = "已中止并导出" if cancelled else "完成"
-        messagebox.showinfo(
-            title,
-            "已输出：\n"
-            + "\n".join(str(path) for path in paths)
-            + "\n\n说明：输出目录里的“过程文件”文件夹只用于排查问题；如果 Word 译文确认没问题，可以删除。",
-        )
-
-    def finish_error(self, error: str):
-        self.start_button.config(state="normal")
-        self.stop_button.config(state="disabled")
-        messagebox.showerror("翻译失败", error)
+        self.add_file_button.config(state="normal")
+        self.clear_files_button.config(state="normal")
+        completed = len([item for item in self.job_results if not item[2]])
+        cancelled = len([item for item in self.job_results if item[2]])
+        failed = len(self.job_errors)
+        lines = [f"全部任务结束：完成 {completed} 个，中止导出 {cancelled} 个，失败 {failed} 个。"]
+        for input_path, paths, was_cancelled in self.job_results[:10]:
+            state = "中止导出" if was_cancelled else "完成"
+            lines.append(f"{state}: {input_path.name}")
+            lines.append(f"  {paths[0]}")
+        for input_path, error in self.job_errors[:10]:
+            lines.append(f"失败: {input_path.name} - {compact_text(error, 120)}")
+        if failed:
+            messagebox.showwarning("部分任务失败", "\n".join(lines))
+        else:
+            messagebox.showinfo("全部任务结束", "\n".join(lines))
 
 
 def main():
