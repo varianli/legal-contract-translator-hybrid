@@ -34,7 +34,7 @@ PROVIDER_DEFAULTS = {
     "OpenAI": {"base_url": "", "model": "gpt-4.1", "key_label": "OpenAI API Key"},
     "DeepSeek": {"base_url": "https://api.deepseek.com", "model": "deepseek-v4-flash", "key_label": "DeepSeek API Key"},
 }
-APP_VERSION = "v1.22"
+APP_VERSION = "v1.23"
 ENGLISH_FONT_OPTIONS = ("Times New Roman", "Calibri")
 CHINESE_FONT_OPTIONS = ("楷体_GB2312", "宋体")
 DEFAULT_ENGLISH_FONT = "Times New Roman"
@@ -2406,8 +2406,11 @@ class HybridApp:
         self.drop_label = Label(self.content, text="把一个或多个 Word 合同拖到这里\n每个文件单独显示翻译/复核进度，并各自输出 Word 与过程文件", relief="groove", height=4)
         self.drop_label.pack(fill=X, padx=16, pady=8)
         if DND_AVAILABLE:
-            self.drop_label.drop_target_register(DND_FILES)
-            self.drop_label.dnd_bind("<<Drop>>", self.on_drop)
+            try:
+                self.drop_label.drop_target_register(DND_FILES)
+                self.drop_label.dnd_bind("<<Drop>>", self.on_drop)
+            except Exception as exc:
+                print(f"{APP_VERSION} drag-and-drop binding is unavailable; continuing without drag-and-drop. Reason: {exc}")
 
         progress_frame = Frame(self.content, padx=16, pady=8)
         progress_frame.pack(fill=X)
@@ -2758,9 +2761,19 @@ class HybridApp:
             messagebox.showinfo("全部任务结束", "\n".join(lines))
 
 
+def create_root():
+    global DND_AVAILABLE
+    if DND_AVAILABLE and TkinterDnD is not None:
+        try:
+            return TkinterDnD.Tk()
+        except Exception as exc:
+            DND_AVAILABLE = False
+            print(f"{APP_VERSION} drag-and-drop support is unavailable; continuing without drag-and-drop. Reason: {exc}")
+    return Tk()
+
+
 def main():
-    root_class = TkinterDnD.Tk if DND_AVAILABLE else Tk
-    root = root_class()
+    root = create_root()
     HybridApp(root)
     root.mainloop()
 
