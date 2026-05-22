@@ -34,7 +34,7 @@ PROVIDER_DEFAULTS = {
     "OpenAI": {"base_url": "", "model": "gpt-4.1", "key_label": "OpenAI API Key"},
     "DeepSeek": {"base_url": "https://api.deepseek.com", "model": "deepseek-v4-flash", "key_label": "DeepSeek API Key"},
 }
-APP_VERSION = "v1.18"
+APP_VERSION = "v1.19"
 ENGLISH_FONT_OPTIONS = ("Times New Roman", "Calibri")
 CHINESE_FONT_OPTIONS = ("楷体_GB2312", "宋体")
 DEFAULT_ENGLISH_FONT = "Times New Roman"
@@ -53,6 +53,7 @@ Return only valid JSON when JSON is requested."""
 FINAL_AUDIT_SYSTEM_PROMPT = """You are a senior legal translation QA reviewer.
 Your task is to quickly audit completed English translations of Chinese capital-markets legal documents under a strict English-only final-output policy.
 Flag any block whose translation still contains Chinese/CJK characters, including legal prose, clause headings, table labels, TOC entries, company names, fund names, investor names, person names, addresses, trademarks, parentheticals, or mixed Chinese-English leftovers.
+Also flag any machine-readable intermediate artifacts, including Markdown/HTML comments, BLOCK markers, META comments, JSON snippets, fenced code blocks, prompt labels, or raw parsing metadata.
 Do not allow English Name (Chinese Name) formatting. Translate or romanize Chinese proper names into English-only text.
 Preserve source placeholder symbols such as 【】 and blanks, but translate any Chinese words inside placeholders.
 Return only valid JSON."""
@@ -384,6 +385,34 @@ def strip_markdown_emphasis(text: str) -> str:
     return text
 
 
+MACHINE_ARTIFACT_PATTERNS = [
+    re.compile(r"<!--.*?-->", re.DOTALL),
+    re.compile(r"<!--|-->"),
+    re.compile(r"\bMETA\s*:", re.IGNORECASE),
+    re.compile(r"\bBLOCK\s*:\s*\d+", re.IGNORECASE),
+    re.compile(r"\{\s*\"(?:style|alignment|left_indent|first_line_indent)\"\s*:", re.IGNORECASE),
+    re.compile(r"```"),
+    re.compile(r"\b(?:CHUNK MARKDOWN|BLOCKS JSON|PARAGRAPHS JSON|TRANSLATION MEMORY|FONT INSTRUCTIONS)\b", re.IGNORECASE),
+]
+
+
+def has_machine_artifacts(text: str) -> bool:
+    text = text or ""
+    return any(pattern.search(text) for pattern in MACHINE_ARTIFACT_PATTERNS)
+
+
+def strip_machine_artifacts(text: str) -> str:
+    text = text or ""
+    text = re.sub(r"<!--\s*META:.*?-->", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<!--\s*BLOCK:\d+\s*-->", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+    text = re.sub(r"```(?:json|markdown|text)?", "", text, flags=re.IGNORECASE)
+    text = text.replace("```", "")
+    text = re.sub(r"^\s*\{\\?\"(?:style|alignment|left_indent|first_line_indent)\\?\".*?\}\s*$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 FULL_RMB_WANYUAN_RE = re.compile(r"^\s*\u4eba\u6c11\u5e01\s*([\u3010\[])?\s*([0-9][0-9,，]*(?:\.\d+)?)\s*([\u3011\]])?\s*\u4e07\u5143\s*$")
 FULL_CHINESE_DATE_RE = re.compile(r"^\s*(\d{4})\s*\u5e74\s*(\d{1,2}|\u3010\u3011|_+)\s*\u6708\s*(\d{1,2}|\u3010\u3011|_+)\s*\u65e5\s*$")
 SOURCE_BRACKET_RE = re.compile(r"\u3010([^\u3011]*)\u3011")
@@ -469,7 +498,7 @@ def normalize_translation_against_source(source_text: str, translation: str) -> 
     deterministic = deterministic_date_translation(source_text)
     if deterministic:
         return deterministic
-    return preserve_source_bracket_tokens(source_text, normalize_legal_english(translation))
+    return preserve_source_bracket_tokens(source_text, normalize_legal_english(strip_machine_artifacts(translation)))
 
 
 def normalize_roman_token(token: str) -> str:
@@ -660,7 +689,7 @@ def iter_table_paragraphs(table, seen):
 
 def iter_cell_paragraphs(cell, seen):
     for paragraph in cell.paragraphs:
-        key = id(paragraph._p)
+        key = paragraph._p
         if key not in seen:
             seen.add(key)
             yield paragraph
@@ -670,7 +699,7 @@ def iter_cell_paragraphs(cell, seen):
 
 def iter_part_paragraphs(part, seen):
     for paragraph in part.paragraphs:
-        key = id(paragraph._p)
+        key = paragraph._p
         if key not in seen:
             seen.add(key)
             yield paragraph
@@ -753,7 +782,7 @@ def parse_translated_markdown(markdown: str) -> dict[int, str]:
     for match in BLOCK_RE.finditer(markdown.strip()):
         block_id = int(match.group(1))
         body = match.group(2).strip()
-        body = re.sub(r"\n<!--\s*META:.*?-->\s*$", "", body, flags=re.DOTALL).strip()
+        body = strip_machine_artifacts(body)
         body = re.sub(r"^#{1,6}\s+", "", body).strip()
         results[block_id] = normalize_legal_english(body)
     return results
@@ -948,8 +977,9 @@ def translate_markdown_chunk(
                 "2. Preserve Markdown heading/list/paragraph structure where reasonable.\n"
                 "3. Translate the visible Chinese text into English using the whole chunk context.\n"
                 "4. Do not translate or remove <!-- META:... --> comments.\n"
-                "5. Do not leave any Chinese/CJK characters in visible translated text. Do not use English Name (Chinese Name) formatting.\n"
-                "6. Translate or romanize Chinese company, fund, person, address, exhibit, appendix, and brand/trademark names into English-only text.\n\n"
+                "5. Do not include <!-- META:... --> comments, JSON metadata, fenced code blocks, or any machine-readable markup in visible translated text.\n"
+                "6. Do not leave any Chinese/CJK characters in visible translated text. Do not use English Name (Chinese Name) formatting.\n"
+                "7. Translate or romanize Chinese company, fund, person, address, exhibit, appendix, and brand/trademark names into English-only text.\n\n"
                 "Workflow reminder:\n"
                 "A. Markdown carries clause hierarchy, indentation/list cues, and some visible formatting signals, but it is not the complete Word run structure.\n"
                 "B. Translate under the Markdown structure first so the English keeps context and legal coherence.\n"
@@ -974,6 +1004,8 @@ def cjk_count(text: str) -> int:
 def needs_translation_repair(source_text: str, translation: str) -> bool:
     translation = translation or ""
     if not translation.strip():
+        return True
+    if has_machine_artifacts(translation):
         return True
     count = cjk_count(translation)
     if not count:
@@ -1268,6 +1300,7 @@ def final_llm_audit_batch(
                 "- Chinese legal prose, headings, labels, table cells, TOC entries, sentence fragments, or parentheticals.\n"
                 "- Chinese company, fund, shareholder, investor, person, trademark, brand, addressee, or address names.\n"
                 "- Chinese text appended to or mixed into an otherwise English sentence.\n\n"
+                "- Machine-readable artifacts such as <!-- META:... -->, <!-- BLOCK:n -->, JSON metadata, fenced code blocks, raw prompt labels, or parsing/debug text.\n\n"
                 "What not to flag:\n"
                 "- The bracket symbols 【】 themselves or blank placeholders such as 【】, as long as the text inside them is not Chinese/CJK.\n"
                 "- English-only romanized or official English proper names.\n\n"
@@ -1285,12 +1318,14 @@ def final_llm_audit_batch(
         for block in batch:
             block_id = int(block["id"])
             translation = translations.get(block_id, "")
-            if cjk_count(translation) and block_id not in issue_ids:
+            if (cjk_count(translation) or has_machine_artifacts(translation)) and block_id not in issue_ids:
                 fragment = "".join(re.findall(r"[\u3400-\u9fff]+", translation))[:80]
+                if not fragment and has_machine_artifacts(translation):
+                    fragment = compact_text(translation, 80)
                 issues.append(
                     {
                         "id": block_id,
-                        "reason": "Strict final-output policy: translation still contains Chinese/CJK characters.",
+                        "reason": "Strict final-output policy: translation still contains Chinese/CJK characters or machine-readable artifacts.",
                         "chinese_fragment": fragment,
                     }
                 )
@@ -1677,7 +1712,7 @@ def rewrite_paragraph(paragraph, translation: str, intervals: list[dict], englis
 
 
 def normalize_final_cleanup_text(text: str) -> str:
-    text = strip_markdown_emphasis(text or "")
+    text = strip_machine_artifacts(strip_markdown_emphasis(text or ""))
     text = text.translate(CJK_PUNCT_TRANSLATION)
     text = re.sub(r" +([,.;:!?\]\)])", r"\1", text)
     text = re.sub(r"([\[\(]) +", r"\1", text)
@@ -1689,13 +1724,17 @@ def normalize_final_cleanup_text(text: str) -> str:
     return text.strip()
 
 
+def has_final_output_issue(text: str) -> bool:
+    return bool(cjk_count(text) or has_machine_artifacts(text))
+
+
 def collect_cjk_document_paragraphs(doc: Document) -> list[dict]:
     items = []
     seen_xml_paragraphs = set()
     for index, paragraph in enumerate(iter_document_paragraphs(doc)):
-        seen_xml_paragraphs.add(id(paragraph._p))
+        seen_xml_paragraphs.add(paragraph._p)
         text = paragraph_text(paragraph)
-        if cjk_count(text):
+        if has_final_output_issue(text):
             items.append(
                 {
                     "id": index,
@@ -1708,7 +1747,7 @@ def collect_cjk_document_paragraphs(doc: Document) -> list[dict]:
             )
             continue
         xml_text = xml_paragraph_text(paragraph._p)
-        if cjk_count(xml_text):
+        if has_final_output_issue(xml_text):
             items.append(
                 {
                     "id": index,
@@ -1729,7 +1768,7 @@ def collect_cjk_document_paragraphs(doc: Document) -> list[dict]:
             continue
         for xml_index, xml_paragraph in enumerate(element.xpath(".//w:p")):
             text = xml_paragraph_text(xml_paragraph)
-            if not cjk_count(text):
+            if not has_final_output_issue(text):
                 continue
             item_id = next_id
             next_id += 1
@@ -1779,11 +1818,11 @@ def final_doc_cleanup_batch(client: OpenAI, provider: str, model: str, memory: s
             "role": "user",
             "content": (
                 "Final visible Word sweep for an already translated English legal document.\n"
-                "Some paragraphs still contain Chinese/CJK characters. Translate or romanize only the remaining Chinese/CJK parts while preserving the existing English text.\n"
+                "Some paragraphs still contain Chinese/CJK characters or machine-readable intermediate artifacts. Translate/romanize remaining Chinese/CJK parts and remove any markup/debug artifacts while preserving the existing English text.\n"
                 "Return JSON exactly like {\"items\":[{\"id\":123,\"translation\":\"...\"}]}.\n\n"
                 "Rules:\n"
                 "1. Return one cleaned paragraph for every input id.\n"
-                "2. The returned translation must contain no Chinese/CJK characters.\n"
+                "2. The returned translation must contain no Chinese/CJK characters and no machine-readable artifacts such as <!-- META:... -->, JSON metadata, BLOCK markers, or fenced code blocks.\n"
                 "3. Do not use English Name (Chinese Name) formatting; use official English names where known, otherwise use English-only romanization or legal-English rendering.\n"
                 "4. Preserve tabs, numbering, page numbers, clause references, dates, amounts, punctuation intent, and line order as much as possible.\n"
                 "5. If a paragraph is a table-of-contents line, translate the title and keep the page number.\n"
@@ -1802,9 +1841,8 @@ def final_doc_cleanup_batch(client: OpenAI, provider: str, model: str, memory: s
             item_id = int(item.get("id"))
         except (TypeError, ValueError):
             continue
-        translation = str(item.get("translation", "")).strip()
-        if translation:
-            cleaned[item_id] = translation
+        if "translation" in item:
+            cleaned[item_id] = str(item.get("translation", "")).strip()
     return cleaned
 
 
@@ -1827,13 +1865,13 @@ def cleanup_remaining_cjk_in_document(
         items = collect_cjk_document_paragraphs(doc)
         remaining = items
         if not items:
-            log(f"{APP_VERSION} final Word sweep passed: no Chinese/CJK remains in visible document text.")
+            log(f"{APP_VERSION} final Word sweep passed: no Chinese/CJK or machine artifacts remain in visible document text.")
             return cleaned_ids, []
-        log(f"{APP_VERSION} final Word sweep round {round_index}: found {len(items)} visible paragraphs with Chinese/CJK.")
+        log(f"{APP_VERSION} final Word sweep round {round_index}: found {len(items)} visible paragraphs with Chinese/CJK or machine artifacts.")
         changed = False
         batches = build_final_doc_cleanup_batches(items)
         for batch_index, batch in enumerate(batches, start=1):
-            progress(len(cleaned_ids), max(1, len(items)), f"{APP_VERSION} final Word Chinese cleanup {batch_index}/{len(batches)}")
+            progress(len(cleaned_ids), max(1, len(items)), f"{APP_VERSION} final Word cleanup {batch_index}/{len(batches)}")
             try:
                 repaired = final_doc_cleanup_batch(client, provider, model, memory, batch, font_instruction)
             except TranslationCancelled:
@@ -1844,10 +1882,12 @@ def cleanup_remaining_cjk_in_document(
             for item in batch:
                 item_id = int(item["id"])
                 old_text = item.get("text", "")
-                new_text = normalize_final_cleanup_text(repaired.get(item_id, ""))
-                if not new_text or new_text == old_text:
+                if item_id not in repaired:
                     continue
-                if cjk_count(new_text) and cjk_count(new_text) >= cjk_count(old_text):
+                new_text = normalize_final_cleanup_text(repaired.get(item_id, ""))
+                if new_text == old_text:
+                    continue
+                if has_final_output_issue(new_text) and cjk_count(new_text) >= cjk_count(old_text) and has_machine_artifacts(new_text) == has_machine_artifacts(old_text):
                     continue
                 if item.get("paragraph") is not None:
                     rewrite_paragraph(item["paragraph"], new_text, [], english_font, chinese_font)
@@ -1862,7 +1902,7 @@ def cleanup_remaining_cjk_in_document(
     remaining = collect_cjk_document_paragraphs(doc)
     if remaining:
         samples = ", ".join(f"{item['id']}: {compact_text(item['text'], 60)}" for item in remaining[:10])
-        log(f"{APP_VERSION} final Word sweep still found Chinese/CJK after cleanup: {samples}{'...' if len(remaining) > 10 else ''}")
+        log(f"{APP_VERSION} final Word sweep still found Chinese/CJK or machine artifacts after cleanup: {samples}{'...' if len(remaining) > 10 else ''}")
     return cleaned_ids, remaining
 
 
@@ -2179,7 +2219,7 @@ def translate_docx_hybrid(
             row["status"] = "APPLIED"
             checklist.append(row)
         if needs_translation_repair(block["text"], translation):
-            checklist.append({"status": "HAS_CHINESE_IN_TRANSLATION", "block_id": block_id, "note": "译文仍疑似存在漏翻或大段中文残留。"})
+            checklist.append({"status": "HAS_FINAL_OUTPUT_ARTIFACT", "block_id": block_id, "note": "译文仍疑似存在漏翻、中文残留或机器标记泄漏。"})
         rewrite_paragraph(paragraphs[block_id], translation, intervals, english_font, chinese_font)
     if not cancelled:
         try:
@@ -2204,7 +2244,7 @@ def translate_docx_hybrid(
                         "style": "",
                         "target_text": "",
                         "confidence": "llm-final-sweep",
-                        "note": "最终 Word 可见文本扫尾发现中文/CJK，并已在导出前重翻清理。",
+                        "note": "最终 Word 可见文本扫尾发现中文/CJK 或机器标记，并已在导出前清理。",
                     }
                 )
             for item in remaining_doc_paragraphs:
@@ -2216,7 +2256,7 @@ def translate_docx_hybrid(
                         "style": item.get("style", ""),
                         "target_text": "",
                         "confidence": "",
-                        "note": "最终 Word 可见文本扫尾后仍检测到中文/CJK，请人工复核该段。",
+                        "note": "最终 Word 可见文本扫尾后仍检测到中文/CJK 或机器标记，请人工复核该段。",
                     }
                 )
         except TranslationCancelled:
@@ -2224,7 +2264,7 @@ def translate_docx_hybrid(
             log("收到中止请求；最终 Word 中文扫尾当前批次不再等待，直接导出最近已完成进度。")
             report_progress(review_progress, 98, "正在导出最近已完成进度")
         except Exception as exc:
-            log(f"{APP_VERSION} final Word Chinese cleanup failed; exporting current document and recording the issue. Reason: {exc}")
+            log(f"{APP_VERSION} final Word cleanup failed; exporting current document and recording the issue. Reason: {exc}")
             for item in collect_cjk_document_paragraphs(doc):
                 checklist.append(
                     {
@@ -2234,7 +2274,7 @@ def translate_docx_hybrid(
                         "style": item.get("style", ""),
                         "target_text": "",
                         "confidence": "",
-                        "note": "最终 Word 可见文本扫尾执行失败，该段仍检测到中文/CJK。",
+                        "note": "最终 Word 可见文本扫尾执行失败，该段仍检测到中文/CJK 或机器标记。",
                     }
                 )
     report_progress(review_progress, 98, "正在导出 Word 和明细文件...")
