@@ -34,7 +34,7 @@ PROVIDER_DEFAULTS = {
     "OpenAI": {"base_url": "", "model": "gpt-4.1", "key_label": "OpenAI API Key"},
     "DeepSeek": {"base_url": "https://api.deepseek.com", "model": "deepseek-v4-flash", "key_label": "DeepSeek API Key"},
 }
-APP_VERSION = "v1.23"
+APP_VERSION = "v1.24"
 ENGLISH_FONT_OPTIONS = ("Times New Roman", "Calibri")
 CHINESE_FONT_OPTIONS = ("楷体_GB2312", "宋体")
 DEFAULT_ENGLISH_FONT = "Times New Roman"
@@ -2403,7 +2403,12 @@ class HybridApp:
         Entry(out_row, textvariable=self.output_dir).pack(side=LEFT, fill=X, expand=True)
         Button(out_row, text="选择目录", command=self.choose_output_dir, width=12).pack(side=RIGHT, padx=(8, 0))
 
-        self.drop_label = Label(self.content, text="把一个或多个 Word 合同拖到这里\n每个文件单独显示翻译/复核进度，并各自输出 Word 与过程文件", relief="groove", height=4)
+        drop_text = (
+            "把一个或多个 Word 合同拖到这里\n每个文件单独显示翻译/复核进度，并各自输出 Word 与过程文件"
+            if DND_AVAILABLE
+            else "当前电脑不支持拖拽输入，请点击上方的“添加文件”选择 Word 文件\n每个文件单独显示翻译/复核进度，并各自输出 Word 与过程文件"
+        )
+        self.drop_label = Label(self.content, text=drop_text, relief="groove", height=4)
         self.drop_label.pack(fill=X, padx=16, pady=8)
         if DND_AVAILABLE:
             try:
