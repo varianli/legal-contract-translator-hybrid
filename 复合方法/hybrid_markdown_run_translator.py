@@ -8,7 +8,7 @@ from copy import copy
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
-from tkinter import BOTH, END, LEFT, RIGHT, X, BooleanVar, Button, Canvas, Checkbutton, Entry, Frame, Label, Listbox, OptionMenu, Scrollbar, StringVar, Text, Tk, filedialog, messagebox
+from tkinter import BOTH, END, LEFT, RIGHT, X, BooleanVar, Button, Canvas, Checkbutton, Entry, Frame, Label, Listbox, Radiobutton, Scrollbar, StringVar, Text, Tk, filedialog, messagebox
 from tkinter.ttk import Progressbar
 
 from docx import Document
@@ -34,7 +34,7 @@ PROVIDER_DEFAULTS = {
     "OpenAI": {"base_url": "", "model": "gpt-4.1", "key_label": "OpenAI API Key"},
     "DeepSeek": {"base_url": "https://api.deepseek.com", "model": "deepseek-v4-flash", "key_label": "DeepSeek API Key"},
 }
-APP_VERSION = "v1.24"
+APP_VERSION = "v1.25"
 ENGLISH_FONT_OPTIONS = ("Times New Roman", "Calibri")
 CHINESE_FONT_OPTIONS = ("楷体_GB2312", "宋体")
 DEFAULT_ENGLISH_FONT = "Times New Roman"
@@ -2362,24 +2362,45 @@ class HybridApp:
         top = Frame(self.content, padx=16, pady=12)
         top.pack(fill=X)
         Label(top, text="API 类型").pack(anchor="w")
-        OptionMenu(top, self.provider, *PROVIDER_DEFAULTS.keys(), command=self.on_provider_change).pack(fill=X, pady=(4, 8))
+        provider_row = Frame(top)
+        provider_row.pack(fill=X, pady=(4, 8))
+        for provider_name in PROVIDER_DEFAULTS:
+            Radiobutton(
+                provider_row,
+                text=provider_name,
+                variable=self.provider,
+                value=provider_name,
+                command=lambda: self.on_provider_change(self.provider.get()),
+            ).pack(side=LEFT, padx=(0, 16))
         self.key_label = Label(top, text=defaults["key_label"])
         self.key_label.pack(anchor="w")
-        Entry(top, textvariable=self.api_key, show="*", width=90).pack(fill=X, pady=(4, 8))
+        self.api_key_entry = Entry(top, show="*", width=90)
+        self.api_key_entry.pack(fill=X, pady=(4, 8))
+        self.set_entry_value(self.api_key_entry, self.api_key.get())
         Label(top, text="Base URL").pack(anchor="w")
-        Entry(top, textvariable=self.base_url, width=90).pack(fill=X, pady=(4, 8))
+        self.base_url_entry = Entry(top, width=90)
+        self.base_url_entry.pack(fill=X, pady=(4, 8))
+        self.set_entry_value(self.base_url_entry, self.base_url.get())
         Label(top, text="模型").pack(anchor="w")
-        Entry(top, textvariable=self.model, width=90).pack(fill=X, pady=(4, 8))
+        self.model_entry = Entry(top, width=90)
+        self.model_entry.pack(fill=X, pady=(4, 8))
+        self.set_entry_value(self.model_entry, self.model.get())
         font_row = Frame(top)
         font_row.pack(fill=X, pady=(0, 8))
         left_font = Frame(font_row)
         left_font.pack(side=LEFT, fill=X, expand=True)
         Label(left_font, text="英文字体（字母）").pack(anchor="w")
-        OptionMenu(left_font, self.english_font, *ENGLISH_FONT_OPTIONS).pack(fill=X, pady=(4, 0))
+        english_font_row = Frame(left_font)
+        english_font_row.pack(fill=X, pady=(4, 0))
+        for font_name in ENGLISH_FONT_OPTIONS:
+            Radiobutton(english_font_row, text=font_name, variable=self.english_font, value=font_name).pack(side=LEFT, padx=(0, 16))
         right_font = Frame(font_row)
         right_font.pack(side=RIGHT, fill=X, expand=True, padx=(12, 0))
         Label(right_font, text=f"中文字体（数字固定 {DIGIT_FONT}）").pack(anchor="w")
-        OptionMenu(right_font, self.chinese_font, *CHINESE_FONT_OPTIONS).pack(fill=X, pady=(4, 0))
+        chinese_font_row = Frame(right_font)
+        chinese_font_row.pack(fill=X, pady=(4, 0))
+        for font_name in CHINESE_FONT_OPTIONS:
+            Radiobutton(chinese_font_row, text=font_name, variable=self.chinese_font, value=font_name).pack(side=LEFT, padx=(0, 16))
         Checkbutton(top, text="记住 API Key（明文保存在本机复合方法目录）", variable=self.remember_key).pack(anchor="w")
 
         file_frame = Frame(self.content, padx=16, pady=8)
@@ -2400,7 +2421,9 @@ class HybridApp:
         Label(file_frame, text="输出目录").pack(anchor="w")
         out_row = Frame(file_frame)
         out_row.pack(fill=X, pady=(4, 0))
-        Entry(out_row, textvariable=self.output_dir).pack(side=LEFT, fill=X, expand=True)
+        self.output_dir_entry = Entry(out_row)
+        self.output_dir_entry.pack(side=LEFT, fill=X, expand=True)
+        self.set_entry_value(self.output_dir_entry, self.output_dir.get())
         Button(out_row, text="选择目录", command=self.choose_output_dir, width=12).pack(side=RIGHT, padx=(8, 0))
 
         drop_text = (
@@ -2436,6 +2459,19 @@ class HybridApp:
         self.log_box.pack(fill=BOTH, expand=True, padx=16, pady=(4, 16))
         self.log(f"{APP_VERSION} 复合方法：Markdown 负责结构和上下文，run 结构负责格式抽取，模型负责格式片段到英文短语的映射。")
 
+    def set_entry_value(self, entry: Entry, value: str) -> None:
+        entry.delete(0, END)
+        entry.insert(0, value or "")
+
+    def get_entry_value(self, entry_name: str, fallback: str = "") -> str:
+        entry = getattr(self, entry_name, None)
+        if entry is None:
+            return fallback
+        try:
+            return entry.get()
+        except Exception:
+            return fallback
+
     def on_content_configure(self, _event=None):
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
@@ -2447,10 +2483,17 @@ class HybridApp:
             self.canvas.yview_scroll(int(-event.delta / 120), "units")
 
     def on_provider_change(self, provider):
+        if provider not in PROVIDER_DEFAULTS:
+            provider = "DeepSeek"
+            self.provider.set(provider)
         defaults = PROVIDER_DEFAULTS[provider]
         self.key_label.config(text=defaults["key_label"])
         self.base_url.set(defaults["base_url"])
         self.model.set(defaults["model"])
+        if hasattr(self, "base_url_entry"):
+            self.set_entry_value(self.base_url_entry, defaults["base_url"])
+        if hasattr(self, "model_entry"):
+            self.set_entry_value(self.model_entry, defaults["model"])
 
     def file_key(self, path: Path) -> str:
         try:
@@ -2521,9 +2564,11 @@ class HybridApp:
             self.log("已删除文件：" + "；".join(path.name for path in reversed(removed)))
 
     def choose_output_dir(self):
-        path = filedialog.askdirectory(title="选择输出目录", initialdir=self.output_dir.get() or str(OUTPUT_DIR))
+        current = self.get_entry_value("output_dir_entry", self.output_dir.get()).strip() or str(OUTPUT_DIR)
+        path = filedialog.askdirectory(title="选择输出目录", initialdir=current)
         if path:
             self.output_dir.set(path)
+            self.set_entry_value(self.output_dir_entry, path)
 
     def on_drop(self, event):
         paths = self.root.tk.splitlist(event.data)
@@ -2610,13 +2655,17 @@ class HybridApp:
         self.root.update_idletasks()
 
     def start(self):
-        provider = self.provider.get().strip()
-        api_key = self.api_key.get().strip()
-        base_url = self.base_url.get().strip()
-        model = self.model.get().strip()
+        provider = self.provider.get().strip() or "DeepSeek"
+        if provider not in PROVIDER_DEFAULTS:
+            provider = "DeepSeek"
+            self.provider.set(provider)
+        api_key = self.get_entry_value("api_key_entry", self.api_key.get()).strip()
+        base_url = self.get_entry_value("base_url_entry", self.base_url.get()).strip()
+        model = self.get_entry_value("model_entry", self.model.get()).strip()
         english_font = valid_english_font(self.english_font.get().strip())
         chinese_font = valid_chinese_font(self.chinese_font.get().strip())
-        output_dir = Path(self.output_dir.get().strip().strip('"'))
+        output_dir_text = self.get_entry_value("output_dir_entry", self.output_dir.get()).strip().strip('"') or str(OUTPUT_DIR)
+        output_dir = Path(output_dir_text)
         if not api_key:
             messagebox.showerror("缺少 API Key", f"请先输入 {provider} API Key。")
             return
@@ -2633,8 +2682,14 @@ class HybridApp:
         if provider == "DeepSeek" and not base_url:
             base_url = PROVIDER_DEFAULTS["DeepSeek"]["base_url"]
             self.base_url.set(base_url)
+            self.set_entry_value(self.base_url_entry, base_url)
+        self.api_key.set(api_key)
+        self.base_url.set(base_url)
+        self.model.set(model)
         self.english_font.set(english_font)
         self.chinese_font.set(chinese_font)
+        self.output_dir.set(str(output_dir))
+        self.set_entry_value(self.output_dir_entry, str(output_dir))
         save_config(provider, api_key if self.remember_key.get() else "", base_url, model, english_font, chinese_font)
         self.is_running = True
         self.job_results = []
