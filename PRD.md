@@ -84,6 +84,7 @@ The selected implementation uses a hybrid method:
 | P1-05 | API validation | Provide API Key test for macOS interface. | User can test API credentials before full translation; authentication failures are shown clearly. |
 | P1-06 | macOS-specific interface | Avoid macOS-incompatible drag-and-drop dependencies. | macOS interface works without `tkinterdnd2`; files are selected by button. |
 | P1-07 | Scrollable UI | Support scrolling on small screens. | Long forms and progress sections can be scrolled with mouse wheel or trackpad. |
+| P1-08 | Cloud project glossary | Support Supabase-based project glossary sync. | User can configure Supabase URL, anon key, project slug, and project token; the tool syncs the current project glossary and uses only chunk-matched terms during translation. |
 
 ### P2 Requirements
 
@@ -122,6 +123,7 @@ The selected implementation uses a hybrid method:
 
 - Run automated checks for missing translations and Chinese/CJK leftovers.
 - Run final LLM audit for untranslated legal content.
+- Check project glossary compliance when a source block contains a cloud glossary term.
 - Run final Word sweep over visible document text.
 - Detect and remove leaked machine artifacts, including Markdown comments, block markers, metadata comments, JSON snippets, and fenced code blocks.
 - Export with checklist notes if any residual risks remain.
@@ -192,6 +194,7 @@ Process files should be stored under a dedicated `过程文件` folder. Users ma
 | v1.22 | Added macOS launcher. |
 | v1.26 | Added dedicated macOS interface. |
 | v1.28 | Improved macOS touchpad scrolling. |
+| v1.29 | Added Supabase-backed project glossary sync and chunk-level glossary injection. |
 
 ## 15. Open Questions
 

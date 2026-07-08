@@ -6,6 +6,7 @@
 
 - 支持 OpenAI 兼容接口和 DeepSeek API。
 - 使用 Markdown 结构保留条款层级和上下文，再结合 Word run 结构映射格式。
+- 支持 Supabase 云端项目术语库：按项目同步术语，只将当前 chunk 命中的术语注入 prompt。
 - 支持多文件翻译，每个文件独立显示翻译进度和复核进度。
 - 支持 Windows 和 macOS 启动脚本。
 - 导出英文 Word 文档，并将中间 Markdown、checklist、JSON 明细放入过程文件夹。
@@ -44,6 +45,24 @@ chmod +x 一键启动.command
 3. 添加一个或多个 `.docx` 文件。
 4. 选择输出目录。
 5. 点击开始翻译。
+
+## Cloud Project Glossary
+
+The tool can optionally sync a project-level glossary from Supabase. The cloud glossary is not sent wholesale to every LLM request. Instead, the desktop client syncs the current project glossary to a local cache, scans each translation chunk locally, and only injects terms matched in that chunk.
+
+Recommended strategy:
+
+- Company, fund, person, and project names: `placeholder_lock`
+- Legal terms and defined terms: `prompt_constraint`
+- Terms that only require final verification: `postcheck`
+
+Supabase setup SQL is available at:
+
+```text
+supabase/glossary_schema.sql
+```
+
+The desktop client should use a Supabase anon key plus a project access token. Do not place a Supabase service-role key in the desktop application.
 
 DeepSeek 默认配置：
 

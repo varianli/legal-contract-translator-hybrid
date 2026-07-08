@@ -4,6 +4,9 @@ import re
 import threading
 import time
 import traceback
+import urllib.error
+import urllib.parse
+import urllib.request
 from copy import copy
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -29,12 +32,13 @@ except Exception:
 APP_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = APP_DIR / "输出"
 CONFIG_PATH = APP_DIR / ".hybrid_config.json"
+CLOUD_GLOSSARY_CACHE_DIR = APP_DIR / ".glossary_cache"
 
 PROVIDER_DEFAULTS = {
     "OpenAI": {"base_url": "", "model": "gpt-4.1", "key_label": "OpenAI API Key"},
     "DeepSeek": {"base_url": "https://api.deepseek.com", "model": "deepseek-v4-flash", "key_label": "DeepSeek API Key"},
 }
-APP_VERSION = "v1.28"
+APP_VERSION = "v1.29"
 ENGLISH_FONT_OPTIONS = ("Times New Roman", "Calibri")
 CHINESE_FONT_OPTIONS = ("楷体_GB2312", "宋体")
 DEFAULT_ENGLISH_FONT = "Times New Roman"
@@ -165,6 +169,16 @@ class FormatSpan:
     italic: bool
     underline: object
     highlight_color: object
+
+
+@dataclass
+class CloudGlossaryTerm:
+    source_text: str
+    target_text: str
+    term_type: str = "legal_term"
+    strategy: str = "prompt_constraint"
+    priority: int = 100
+    notes: str = ""
 
 
 W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
@@ -560,22 +574,238 @@ def load_config() -> dict:
     return {}
 
 
-def save_config(provider: str, api_key: str, base_url: str, model: str, english_font: str, chinese_font: str) -> None:
+def save_config(
+    provider: str,
+    api_key: str,
+    base_url: str,
+    model: str,
+    english_font: str,
+    chinese_font: str,
+    cloud_glossary: dict | None = None,
+) -> None:
+    payload = {
+        "provider": provider,
+        "api_key": api_key,
+        "base_url": base_url,
+        "model": model,
+        "english_font": english_font,
+        "chinese_font": chinese_font,
+    }
+    if cloud_glossary:
+        payload.update(cloud_glossary)
     CONFIG_PATH.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def normalize_supabase_url(url: str) -> str:
+    return (url or "").strip().rstrip("/")
+
+
+def cloud_glossary_configured(config: dict) -> bool:
+    return bool(
+        config.get("cloud_glossary_enabled")
+        and normalize_supabase_url(config.get("supabase_url", ""))
+        and config.get("supabase_anon_key", "").strip()
+        and config.get("glossary_project_slug", "").strip()
+        and config.get("glossary_access_token", "").strip()
+    )
+
+
+def cloud_glossary_cache_path(project_slug: str) -> Path:
+    safe_slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", project_slug or "default").strip("_") or "default"
+    return CLOUD_GLOSSARY_CACHE_DIR / f"{safe_slug}.json"
+
+
+def parse_cloud_glossary_terms(items) -> list[CloudGlossaryTerm]:
+    terms: list[CloudGlossaryTerm] = []
+    for item in items or []:
+        source_text = str(item.get("source_text", "")).strip()
+        target_text = str(item.get("target_text", "")).strip()
+        if not source_text or not target_text:
+            continue
+        try:
+            priority = int(item.get("priority", 100))
+        except (TypeError, ValueError):
+            priority = 100
+        terms.append(
+            CloudGlossaryTerm(
+                source_text=source_text,
+                target_text=target_text,
+                term_type=str(item.get("term_type", "legal_term")).strip() or "legal_term",
+                strategy=str(item.get("strategy", "prompt_constraint")).strip() or "prompt_constraint",
+                priority=priority,
+                notes=str(item.get("notes", "")).strip(),
+            )
+        )
+    terms.sort(key=lambda term: (-term.priority, -len(term.source_text), term.source_text))
+    return terms
+
+
+def fetch_supabase_project_glossary(supabase_url: str, anon_key: str, project_slug: str, access_token: str) -> list[CloudGlossaryTerm]:
+    endpoint = f"{normalize_supabase_url(supabase_url)}/rest/v1/rpc/get_project_glossary"
+    body = json.dumps({"p_project_slug": project_slug, "p_access_token": access_token}).encode("utf-8")
+    request = urllib.request.Request(
+        endpoint,
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "apikey": anon_key,
+            "Authorization": f"Bearer {anon_key}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            raw = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Supabase glossary sync failed: HTTP {exc.code} {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Supabase glossary sync failed: {exc.reason}") from exc
+    data = json.loads(raw or "[]")
+    if isinstance(data, dict) and "error" in data:
+        raise RuntimeError(f"Supabase glossary sync failed: {data}")
+    return parse_cloud_glossary_terms(data)
+
+
+def load_cached_project_glossary(project_slug: str) -> list[CloudGlossaryTerm]:
+    path = cloud_glossary_cache_path(project_slug)
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    return parse_cloud_glossary_terms(data.get("terms", data))
+
+
+def save_cached_project_glossary(project_slug: str, terms: list[CloudGlossaryTerm]) -> None:
+    CLOUD_GLOSSARY_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    path = cloud_glossary_cache_path(project_slug)
+    path.write_text(
         json.dumps(
             {
-                "provider": provider,
-                "api_key": api_key,
-                "base_url": base_url,
-                "model": model,
-                "english_font": english_font,
-                "chinese_font": chinese_font,
+                "project_slug": project_slug,
+                "synced_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "terms": [term.__dict__ for term in terms],
             },
             ensure_ascii=False,
             indent=2,
         ),
         encoding="utf-8",
     )
+
+
+def load_project_glossary_from_config(config: dict, log) -> list[CloudGlossaryTerm]:
+    if not cloud_glossary_configured(config):
+        return []
+    project_slug = config.get("glossary_project_slug", "").strip()
+    try:
+        terms = fetch_supabase_project_glossary(
+            config.get("supabase_url", ""),
+            config.get("supabase_anon_key", "").strip(),
+            project_slug,
+            config.get("glossary_access_token", "").strip(),
+        )
+        save_cached_project_glossary(project_slug, terms)
+        log(f"{APP_VERSION} 云端项目术语库已同步：{project_slug}，{len(terms)} 条。")
+        return terms
+    except Exception as exc:
+        cached = load_cached_project_glossary(project_slug)
+        if cached:
+            log(f"{APP_VERSION} 云端术语库同步失败，已使用本地缓存 {len(cached)} 条。原因：{exc}")
+            return cached
+        log(f"{APP_VERSION} 云端术语库同步失败，继续无术语库翻译。原因：{exc}")
+        return []
+
+
+def glossary_terms_for_text(terms: list[CloudGlossaryTerm], text: str, max_terms: int = 80) -> list[CloudGlossaryTerm]:
+    matched = []
+    seen = set()
+    for term in terms or []:
+        if term.source_text in (text or "") and term.source_text not in seen:
+            matched.append(term)
+            seen.add(term.source_text)
+        if len(matched) >= max_terms:
+            break
+    return matched
+
+
+def apply_glossary_placeholders(text: str, terms: list[CloudGlossaryTerm]) -> tuple[str, list[dict]]:
+    matched = [
+        term
+        for term in glossary_terms_for_text(terms, text)
+        if term.strategy in {"placeholder_lock", "lock", "exact"}
+    ]
+    placeholder_maps = []
+    output = text
+    for index, term in enumerate(matched, start=1):
+        placeholder = f"[[GLOSSARY_{index:04d}]]"
+        if term.source_text not in output:
+            continue
+        output = output.replace(term.source_text, placeholder)
+        placeholder_maps.append(
+            {
+                "placeholder": placeholder,
+                "source_text": term.source_text,
+                "target_text": term.target_text,
+                "term_type": term.term_type,
+                "strategy": term.strategy,
+            }
+        )
+    return output, placeholder_maps
+
+
+def apply_existing_glossary_placeholders(text: str, placeholder_maps: list[dict]) -> str:
+    output = text
+    for item in placeholder_maps:
+        source_text = item.get("source_text", "")
+        placeholder = item.get("placeholder", "")
+        if source_text and placeholder:
+            output = output.replace(source_text, placeholder)
+    return output
+
+
+def restore_glossary_placeholders(text: str, placeholder_maps: list[dict]) -> str:
+    output = text
+    for item in placeholder_maps:
+        placeholder = item.get("placeholder", "")
+        target_text = item.get("target_text", "")
+        if placeholder and target_text:
+            output = output.replace(placeholder, target_text)
+    return output
+
+
+def project_glossary_prompt_for_text(terms: list[CloudGlossaryTerm], text: str, placeholder_maps: list[dict] | None = None) -> str:
+    matched = glossary_terms_for_text(terms, text)
+    if not matched and not placeholder_maps:
+        return "(none for this request)"
+    lines = [
+        "Project cloud glossary terms matched for this request.",
+        "Use only these matched terms; do not infer unrelated glossary entries.",
+    ]
+    if placeholder_maps:
+        lines.append("Placeholder-locked terms: preserve each placeholder exactly; the program will restore the required English term after translation.")
+        for item in placeholder_maps:
+            lines.append(f"- {item['placeholder']} => {item['target_text']} (source: {item['source_text']}; type: {item.get('term_type', '')})")
+    prompt_terms = [
+        term
+        for term in matched
+        if term.strategy not in {"placeholder_lock", "lock", "exact"}
+    ]
+    if prompt_terms:
+        lines.append("Prompt-constrained terms:")
+        for term in prompt_terms[:60]:
+            note = f"; note: {term.notes}" if term.notes else ""
+            lines.append(f"- {term.source_text} => {term.target_text} (type: {term.term_type}; strategy: {term.strategy}; priority: {term.priority}{note})")
+    return "\n".join(lines)
+
+
+def combine_glossary_prompts(*parts: str) -> str:
+    useful = [part for part in parts if part and part.strip() and part.strip() != "(none for this request)"]
+    return "\n\n".join(useful) if useful else "(none)"
 
 
 def build_client(api_key: str, base_url: str) -> OpenAI:
@@ -1087,6 +1317,7 @@ def repair_chunk_translations(
     total: int,
     font_instruction: str,
     company_glossary: str,
+    project_glossary_terms: list[CloudGlossaryTerm] | None = None,
 ) -> set[int]:
     block_by_id = {int(block["id"]): block for block in chunk}
     bad_blocks = []
@@ -1105,8 +1336,13 @@ def repair_chunk_translations(
     batches = build_repair_batches(bad_blocks)
     for index, batch in enumerate(batches, start=1):
         progress(completed, total, f"自修复漏翻/中文残留 {index}/{len(batches)}")
+        batch_text = "\n".join(block.get("text", "") for block in batch)
+        batch_glossary = combine_glossary_prompts(
+            company_glossary,
+            project_glossary_prompt_for_text(project_glossary_terms or [], batch_text),
+        )
         try:
-            repaired = repair_translation_batch(client, provider, model, memory, batch, font_instruction, company_glossary)
+            repaired = repair_translation_batch(client, provider, model, memory, batch, font_instruction, batch_glossary)
         except TranslationCancelled:
             raise
         except Exception as exc:
@@ -1124,8 +1360,12 @@ def repair_chunk_translations(
             block_id = int(block["id"])
             if block_id in repaired_ids and not needs_translation_repair(block["text"], translations.get(block_id, "")):
                 continue
+            single_glossary = combine_glossary_prompts(
+                company_glossary,
+                project_glossary_prompt_for_text(project_glossary_terms or [], block.get("text", "")),
+            )
             try:
-                single = repair_translation_batch(client, provider, model, memory, [block], font_instruction, company_glossary)
+                single = repair_translation_batch(client, provider, model, memory, [block], font_instruction, single_glossary)
             except TranslationCancelled:
                 raise
             except Exception as exc:
@@ -1149,6 +1389,7 @@ def repair_all_translations(
     progress,
     font_instruction: str,
     company_glossary: str,
+    project_glossary_terms: list[CloudGlossaryTerm] | None = None,
     max_rounds: int = 5,
 ) -> set[int]:
     repaired_ids: set[int] = set()
@@ -1171,8 +1412,13 @@ def repair_all_translations(
         batches = build_repair_batches(bad_blocks)
         for batch_index, batch in enumerate(batches, start=1):
             progress(total - len(bad_blocks), total, f"全文自修复第 {round_index} 轮 {batch_index}/{len(batches)}")
+            batch_text = "\n".join(block.get("text", "") for block in batch)
+            batch_glossary = combine_glossary_prompts(
+                company_glossary,
+                project_glossary_prompt_for_text(project_glossary_terms or [], batch_text),
+            )
             try:
-                repaired = repair_translation_batch(client, provider, model, memory, batch, font_instruction, company_glossary)
+                repaired = repair_translation_batch(client, provider, model, memory, batch, font_instruction, batch_glossary)
             except TranslationCancelled:
                 raise
             except Exception as exc:
@@ -1192,8 +1438,12 @@ def repair_all_translations(
                 block_id = int(block["id"])
                 if not needs_translation_repair(block["text"], translations.get(block_id, "")):
                     continue
+                single_glossary = combine_glossary_prompts(
+                    company_glossary,
+                    project_glossary_prompt_for_text(project_glossary_terms or [], block.get("text", "")),
+                )
                 try:
-                    single = repair_translation_batch(client, provider, model, memory, [block], font_instruction, company_glossary)
+                    single = repair_translation_batch(client, provider, model, memory, [block], font_instruction, single_glossary)
                 except TranslationCancelled:
                     raise
                 except Exception as exc:
@@ -1263,6 +1513,27 @@ def deterministic_company_name_audit_issues(batch: list[dict], translations: dic
     return issues
 
 
+def deterministic_project_glossary_audit_issues(batch: list[dict], translations: dict[int, str], project_terms: list[CloudGlossaryTerm] | None) -> list[dict]:
+    issues = []
+    for block in batch:
+        block_id = int(block["id"])
+        source_text = block.get("text", "")
+        translation = translations.get(block_id, "")
+        for term in glossary_terms_for_text(project_terms or [], source_text):
+            if term.strategy not in {"placeholder_lock", "lock", "exact", "prompt_constraint", "postcheck"}:
+                continue
+            if term.target_text and term.target_text not in translation:
+                issues.append(
+                    {
+                        "id": block_id,
+                        "reason": f"Project glossary term should use fixed rendering: {term.source_text} => {term.target_text}",
+                        "chinese_fragment": term.source_text,
+                    }
+                )
+                break
+    return issues
+
+
 def final_llm_audit_batch(
     client: OpenAI,
     provider: str,
@@ -1271,6 +1542,7 @@ def final_llm_audit_batch(
     translations: dict[int, str],
     company_entries: list[dict],
     company_glossary: str,
+    project_glossary_terms: list[CloudGlossaryTerm] | None = None,
 ) -> list[dict]:
     payload = []
     rag_text_parts = []
@@ -1313,6 +1585,7 @@ def final_llm_audit_batch(
     data = chat_json(client, provider, model, messages, retries=2)
     batch_ids = {int(block["id"]) for block in batch}
     issues = deterministic_company_name_audit_issues(batch, translations, company_entries)
+    issues.extend(deterministic_project_glossary_audit_issues(batch, translations, project_glossary_terms))
     issue_ids = {int(issue["id"]) for issue in issues}
     if STRICT_NO_CJK_OUTPUT:
         for block in batch:
@@ -1359,6 +1632,7 @@ def final_llm_audit_and_repair_translations(
     font_instruction: str,
     company_entries: list[dict],
     company_glossary: str,
+    project_glossary_terms: list[CloudGlossaryTerm] | None = None,
     max_rounds: int = 2,
 ) -> set[int]:
     repaired_ids: set[int] = set()
@@ -1369,8 +1643,13 @@ def final_llm_audit_and_repair_translations(
         issues = []
         for batch_index, batch in enumerate(build_final_audit_batches(blocks, translations), start=1):
             progress(total, total, f"{APP_VERSION} final LLM audit {batch_index}")
+            batch_text = "\n".join(block.get("text", "") for block in batch)
+            batch_glossary = combine_glossary_prompts(
+                company_glossary,
+                project_glossary_prompt_for_text(project_glossary_terms or [], batch_text),
+            )
             try:
-                issues.extend(final_llm_audit_batch(client, provider, model, batch, translations, company_entries, company_glossary))
+                issues.extend(final_llm_audit_batch(client, provider, model, batch, translations, company_entries, batch_glossary, project_glossary_terms))
             except TranslationCancelled:
                 raise
             except Exception as exc:
@@ -1398,8 +1677,13 @@ def final_llm_audit_and_repair_translations(
         changed = False
         for batch_index, batch in enumerate(build_repair_batches(bad_blocks), start=1):
             progress(total, total, f"{APP_VERSION} final LLM repair {round_index}-{batch_index}")
+            batch_text = "\n".join(block.get("text", "") for block in batch)
+            batch_glossary = combine_glossary_prompts(
+                company_glossary,
+                project_glossary_prompt_for_text(project_glossary_terms or [], batch_text),
+            )
             try:
-                repaired = repair_translation_batch(client, provider, model, memory, batch, font_instruction, company_glossary)
+                repaired = repair_translation_batch(client, provider, model, memory, batch, font_instruction, batch_glossary)
             except TranslationCancelled:
                 raise
             except Exception as exc:
@@ -1418,8 +1702,12 @@ def final_llm_audit_and_repair_translations(
                 block_id = int(block["id"])
                 if block_id in repaired_ids and not needs_translation_repair(block["text"], translations.get(block_id, "")):
                     continue
+                single_glossary = combine_glossary_prompts(
+                    company_glossary,
+                    project_glossary_prompt_for_text(project_glossary_terms or [], block.get("text", "")),
+                )
                 try:
-                    single = repair_translation_batch(client, provider, model, memory, [block], font_instruction, company_glossary)
+                    single = repair_translation_batch(client, provider, model, memory, [block], font_instruction, single_glossary)
                 except TranslationCancelled:
                     raise
                 except Exception as exc:
@@ -1998,6 +2286,7 @@ def translate_docx_hybrid(
         raise ValueError("没有在文档中发现中文内容。")
 
     source_markdown = "\n\n".join(block["markdown"] for block in blocks)
+    project_glossary_terms = load_project_glossary_from_config(load_config(), log)
     client = build_client(api_key, base_url)
     report_progress(review_progress, 0, "等待翻译完成后开始复核检查")
     if ENABLE_COMPANY_NAME_GLOSSARY:
@@ -2008,8 +2297,12 @@ def translate_docx_hybrid(
         company_entries = []
         company_glossary = "(disabled; do not force English Name (Chinese Name) formatting)"
         log(f"{APP_VERSION} 公司名强制“英文（中文）”纠错已关闭，避免复核阶段反复重翻。")
+    memory_glossary = combine_glossary_prompts(
+        company_glossary,
+        "(cloud project glossary enabled; only terms matched in each chunk are supplied to translation prompts)" if project_glossary_terms else "",
+    )
     report_progress(translation_progress, 4, "正在生成术语记忆和翻译规则...")
-    memory = make_translation_memory(client, provider, model, source_markdown, log, font_instruction, company_glossary)
+    memory = make_translation_memory(client, provider, model, source_markdown, log, font_instruction, memory_glossary)
     chunks = build_chunks(blocks)
     log(f"{APP_VERSION} 复合方法：{len(blocks)} 个中文 block，分为 {len(chunks)} 个 Markdown 大段批次。")
     log(f"字体设置：英文 {english_font}；数字 {DIGIT_FONT}；中文 {chinese_font}。")
@@ -2026,18 +2319,26 @@ def translate_docx_hybrid(
             cancelled = True
             log("收到中止请求，停止进入下一个 Markdown 批次，开始导出当前进度。")
             break
-        chunk_markdown = "\n\n".join(block["markdown"] for block in chunk)
+        chunk_markdown_raw = "\n\n".join(block["markdown"] for block in chunk)
+        chunk_markdown, placeholder_maps = apply_glossary_placeholders(chunk_markdown_raw, project_glossary_terms)
         before = "\n\n".join(block["markdown"] for block in blocks[max(0, blocks.index(chunk[0]) - 3) : blocks.index(chunk[0])])
         after_start = blocks.index(chunk[-1]) + 1
         after = "\n\n".join(block["markdown"] for block in blocks[after_start : min(len(blocks), after_start + 3)])
+        before = apply_existing_glossary_placeholders(before, placeholder_maps)
+        after = apply_existing_glossary_placeholders(after, placeholder_maps)
+        chunk_glossary = combine_glossary_prompts(
+            company_glossary,
+            project_glossary_prompt_for_text(project_glossary_terms, chunk_markdown_raw, placeholder_maps),
+        )
         report_phase(translation_progress, 5, 99, completed, len(blocks), f"翻译 Markdown 大段 {chunk_index}/{len(chunks)}")
         try:
-            translated_markdown = translate_markdown_chunk(client, provider, model, memory, chunk_markdown, before, after, font_instruction, company_glossary)
+            translated_markdown = translate_markdown_chunk(client, provider, model, memory, chunk_markdown, before, after, font_instruction, chunk_glossary)
         except TranslationCancelled:
             cancelled = True
             log("收到中止请求；当前 API 批次不再等待，直接导出最近已完成进度。")
             report_progress(review_progress, 85, "正在导出最近已完成进度")
             break
+        translated_markdown = restore_glossary_placeholders(translated_markdown, placeholder_maps)
         translated_markdown_parts.append(translated_markdown)
         chunk_translations = parse_translated_markdown(translated_markdown)
         for block in chunk:
@@ -2069,6 +2370,7 @@ def translate_docx_hybrid(
                     make_phase_progress(review_progress, 0, 35),
                     font_instruction,
                     company_glossary,
+                    project_glossary_terms,
                 )
             )
         except TranslationCancelled:
@@ -2090,6 +2392,7 @@ def translate_docx_hybrid(
                     font_instruction,
                     company_entries,
                     company_glossary,
+                    project_glossary_terms,
                 )
             )
         except TranslationCancelled:
@@ -2306,6 +2609,7 @@ def translate_docx_hybrid(
             {
                 "cancelled": cancelled,
                 "company_glossary": company_entries,
+                "project_glossary": [term.__dict__ for term in project_glossary_terms],
                 "blocks": blocks,
                 "mappings": all_mappings,
                 "checklist": checklist,
@@ -2340,6 +2644,11 @@ class HybridApp:
         self.chinese_font = StringVar(value=valid_chinese_font(config.get("chinese_font", DEFAULT_CHINESE_FONT)))
         self.output_dir = StringVar(value=str(OUTPUT_DIR))
         self.remember_key = BooleanVar(value=bool(config.get("api_key")))
+        self.cloud_glossary_enabled = BooleanVar(value=bool(config.get("cloud_glossary_enabled")))
+        self.supabase_url = StringVar(value=config.get("supabase_url", ""))
+        self.supabase_anon_key = StringVar(value=config.get("supabase_anon_key", ""))
+        self.glossary_project_slug = StringVar(value=config.get("glossary_project_slug", ""))
+        self.glossary_access_token = StringVar(value=config.get("glossary_access_token", ""))
         self.file_paths: list[Path] = []
         self.job_widgets: dict[str, dict] = {}
         self.job_cancel_events: dict[str, threading.Event] = {}
@@ -2402,6 +2711,33 @@ class HybridApp:
         for font_name in CHINESE_FONT_OPTIONS:
             Radiobutton(chinese_font_row, text=font_name, variable=self.chinese_font, value=font_name).pack(side=LEFT, padx=(0, 16))
         Checkbutton(top, text="记住 API Key（明文保存在本机复合方法目录）", variable=self.remember_key).pack(anchor="w")
+
+        glossary_frame = Frame(self.content, padx=16, pady=8)
+        glossary_frame.pack(fill=X)
+        Checkbutton(glossary_frame, text="启用云端项目术语库（Supabase）", variable=self.cloud_glossary_enabled).pack(anchor="w")
+        Label(glossary_frame, text="Supabase URL").pack(anchor="w", pady=(6, 0))
+        self.supabase_url_entry = Entry(glossary_frame, width=90)
+        self.supabase_url_entry.pack(fill=X, pady=(2, 4))
+        self.set_entry_value(self.supabase_url_entry, self.supabase_url.get())
+        Label(glossary_frame, text="Supabase anon key").pack(anchor="w")
+        self.supabase_anon_key_entry = Entry(glossary_frame, show="*", width=90)
+        self.supabase_anon_key_entry.pack(fill=X, pady=(2, 4))
+        self.set_entry_value(self.supabase_anon_key_entry, self.supabase_anon_key.get())
+        project_row = Frame(glossary_frame)
+        project_row.pack(fill=X)
+        left_project = Frame(project_row)
+        left_project.pack(side=LEFT, fill=X, expand=True)
+        Label(left_project, text="项目 slug").pack(anchor="w")
+        self.glossary_project_slug_entry = Entry(left_project)
+        self.glossary_project_slug_entry.pack(fill=X, pady=(2, 4))
+        self.set_entry_value(self.glossary_project_slug_entry, self.glossary_project_slug.get())
+        right_project = Frame(project_row)
+        right_project.pack(side=RIGHT, fill=X, expand=True, padx=(12, 0))
+        Label(right_project, text="项目访问 token").pack(anchor="w")
+        self.glossary_access_token_entry = Entry(right_project, show="*")
+        self.glossary_access_token_entry.pack(fill=X, pady=(2, 4))
+        self.set_entry_value(self.glossary_access_token_entry, self.glossary_access_token.get())
+        Button(glossary_frame, text="同步/测试当前项目术语库", command=self.sync_cloud_glossary, width=24).pack(anchor="e", pady=(4, 0))
 
         file_frame = Frame(self.content, padx=16, pady=8)
         file_frame.pack(fill=X)
@@ -2471,6 +2807,35 @@ class HybridApp:
             return entry.get()
         except Exception:
             return fallback
+
+    def get_cloud_glossary_config(self) -> dict:
+        return {
+            "cloud_glossary_enabled": bool(self.cloud_glossary_enabled.get()),
+            "supabase_url": self.get_entry_value("supabase_url_entry", self.supabase_url.get()).strip(),
+            "supabase_anon_key": self.get_entry_value("supabase_anon_key_entry", self.supabase_anon_key.get()).strip(),
+            "glossary_project_slug": self.get_entry_value("glossary_project_slug_entry", self.glossary_project_slug.get()).strip(),
+            "glossary_access_token": self.get_entry_value("glossary_access_token_entry", self.glossary_access_token.get()).strip(),
+        }
+
+    def sync_cloud_glossary(self):
+        config = self.get_cloud_glossary_config()
+        if not cloud_glossary_configured(config):
+            messagebox.showerror("术语库配置不完整", "请填写 Supabase URL、anon key、项目 slug 和项目访问 token，并勾选启用。")
+            return
+        try:
+            terms = fetch_supabase_project_glossary(
+                config["supabase_url"],
+                config["supabase_anon_key"],
+                config["glossary_project_slug"],
+                config["glossary_access_token"],
+            )
+            save_cached_project_glossary(config["glossary_project_slug"], terms)
+        except Exception as exc:
+            messagebox.showerror("术语库同步失败", str(exc))
+            self.log(f"术语库同步失败：{exc}")
+            return
+        messagebox.showinfo("术语库同步成功", f"已同步 {len(terms)} 条项目术语。")
+        self.log(f"术语库同步成功：{config['glossary_project_slug']}，{len(terms)} 条。")
 
     def on_content_configure(self, _event=None):
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
@@ -2690,7 +3055,7 @@ class HybridApp:
         self.chinese_font.set(chinese_font)
         self.output_dir.set(str(output_dir))
         self.set_entry_value(self.output_dir_entry, str(output_dir))
-        save_config(provider, api_key if self.remember_key.get() else "", base_url, model, english_font, chinese_font)
+        save_config(provider, api_key if self.remember_key.get() else "", base_url, model, english_font, chinese_font, self.get_cloud_glossary_config())
         self.is_running = True
         self.job_results = []
         self.job_errors = []

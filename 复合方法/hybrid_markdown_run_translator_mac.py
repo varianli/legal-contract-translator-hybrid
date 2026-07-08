@@ -7,7 +7,7 @@ from tkinter import filedialog, messagebox, ttk
 import hybrid_markdown_run_translator as core
 
 
-MAC_APP_VERSION = "v1.28-mac"
+MAC_APP_VERSION = "v1.29-mac"
 
 
 def friendly_error(exc: Exception) -> str:
@@ -42,6 +42,7 @@ class MacHybridApp:
         self.english_font = tk.StringVar(value=core.valid_english_font(config.get("english_font", core.DEFAULT_ENGLISH_FONT)))
         self.chinese_font = tk.StringVar(value=core.valid_chinese_font(config.get("chinese_font", core.DEFAULT_CHINESE_FONT)))
         self.remember_key = tk.BooleanVar(value=bool(config.get("api_key")))
+        self.cloud_glossary_enabled = tk.BooleanVar(value=bool(config.get("cloud_glossary_enabled")))
         self.file_paths: list[Path] = []
         self.job_widgets: dict[str, dict] = {}
         self.job_cancel_events: dict[str, threading.Event] = {}
@@ -110,8 +111,30 @@ class MacHybridApp:
         ttk.Checkbutton(key_row, text="记住 API Key（明文保存在本机目录）", variable=self.remember_key).pack(side="left")
         ttk.Button(key_row, text="测试 API Key", command=self.test_api_key).pack(side="right")
 
+        glossary = ttk.LabelFrame(self.content, text="云端项目术语库（Supabase）", padding=12)
+        glossary.grid(row=1, column=0, sticky="ew", padx=14, pady=8)
+        glossary.columnconfigure(1, weight=1)
+        ttk.Checkbutton(glossary, text="启用云端项目术语库", variable=self.cloud_glossary_enabled).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        ttk.Label(glossary, text="Supabase URL").grid(row=1, column=0, sticky="w", pady=3)
+        self.supabase_url_entry = ttk.Entry(glossary)
+        self.supabase_url_entry.grid(row=1, column=1, sticky="ew", pady=3)
+        self.supabase_url_entry.insert(0, config.get("supabase_url", ""))
+        ttk.Label(glossary, text="Supabase anon key").grid(row=2, column=0, sticky="w", pady=3)
+        self.supabase_anon_key_entry = ttk.Entry(glossary, show="*")
+        self.supabase_anon_key_entry.grid(row=2, column=1, sticky="ew", pady=3)
+        self.supabase_anon_key_entry.insert(0, config.get("supabase_anon_key", ""))
+        ttk.Label(glossary, text="项目 slug").grid(row=3, column=0, sticky="w", pady=3)
+        self.glossary_project_slug_entry = ttk.Entry(glossary)
+        self.glossary_project_slug_entry.grid(row=3, column=1, sticky="ew", pady=3)
+        self.glossary_project_slug_entry.insert(0, config.get("glossary_project_slug", ""))
+        ttk.Label(glossary, text="项目访问 token").grid(row=4, column=0, sticky="w", pady=3)
+        self.glossary_access_token_entry = ttk.Entry(glossary, show="*")
+        self.glossary_access_token_entry.grid(row=4, column=1, sticky="ew", pady=3)
+        self.glossary_access_token_entry.insert(0, config.get("glossary_access_token", ""))
+        ttk.Button(glossary, text="同步/测试当前项目术语库", command=self.sync_cloud_glossary).grid(row=5, column=1, sticky="e", pady=(6, 0))
+
         files = ttk.LabelFrame(self.content, text="文件与输出", padding=12)
-        files.grid(row=1, column=0, sticky="ew", padx=14, pady=8)
+        files.grid(row=2, column=0, sticky="ew", padx=14, pady=8)
         files.columnconfigure(0, weight=1)
         file_buttons = ttk.Frame(files)
         file_buttons.grid(row=0, column=0, sticky="ew")
@@ -134,7 +157,7 @@ class MacHybridApp:
         ttk.Button(output_row, text="选择目录", command=self.choose_output_dir).grid(row=0, column=2, padx=(8, 0))
 
         actions = ttk.Frame(self.content, padding=(14, 4))
-        actions.grid(row=2, column=0, sticky="ew")
+        actions.grid(row=3, column=0, sticky="ew")
         actions.columnconfigure(0, weight=1)
         self.start_button = ttk.Button(actions, text="开始翻译所选文件", command=self.start)
         self.start_button.grid(row=0, column=0, sticky="ew")
@@ -142,7 +165,7 @@ class MacHybridApp:
         self.stop_button.grid(row=0, column=1, padx=(8, 0))
 
         progress_outer = ttk.LabelFrame(self.content, text="文件进度", padding=10)
-        progress_outer.grid(row=3, column=0, sticky="nsew", padx=14, pady=8)
+        progress_outer.grid(row=4, column=0, sticky="nsew", padx=14, pady=8)
         progress_outer.columnconfigure(0, weight=1)
         self.jobs_canvas = tk.Canvas(progress_outer, height=230, highlightthickness=0)
         self.jobs_scrollbar = ttk.Scrollbar(progress_outer, orient="vertical", command=self.jobs_canvas.yview)
@@ -157,7 +180,7 @@ class MacHybridApp:
         self.empty_jobs_label.pack(anchor="w", pady=8)
 
         log_outer = ttk.LabelFrame(self.content, text="日志", padding=8)
-        log_outer.grid(row=4, column=0, sticky="nsew", padx=14, pady=(8, 14))
+        log_outer.grid(row=5, column=0, sticky="nsew", padx=14, pady=(8, 14))
         log_outer.columnconfigure(0, weight=1)
         log_outer.rowconfigure(0, weight=1)
         self.log_box = tk.Text(log_outer, height=10, wrap="word")
@@ -216,6 +239,35 @@ class MacHybridApp:
             base_url = core.PROVIDER_DEFAULTS["DeepSeek"]["base_url"]
             self.set_entry(self.base_url_entry, base_url)
         return provider, api_key, base_url, model
+
+    def get_cloud_glossary_config(self) -> dict:
+        return {
+            "cloud_glossary_enabled": bool(self.cloud_glossary_enabled.get()),
+            "supabase_url": self.supabase_url_entry.get().strip(),
+            "supabase_anon_key": self.supabase_anon_key_entry.get().strip(),
+            "glossary_project_slug": self.glossary_project_slug_entry.get().strip(),
+            "glossary_access_token": self.glossary_access_token_entry.get().strip(),
+        }
+
+    def sync_cloud_glossary(self) -> None:
+        config = self.get_cloud_glossary_config()
+        if not core.cloud_glossary_configured(config):
+            messagebox.showerror("术语库配置不完整", "请填写 Supabase URL、anon key、项目 slug 和项目访问 token，并勾选启用。")
+            return
+        try:
+            terms = core.fetch_supabase_project_glossary(
+                config["supabase_url"],
+                config["supabase_anon_key"],
+                config["glossary_project_slug"],
+                config["glossary_access_token"],
+            )
+            core.save_cached_project_glossary(config["glossary_project_slug"], terms)
+        except Exception as exc:
+            messagebox.showerror("术语库同步失败", str(exc))
+            self.log(f"术语库同步失败：{exc}")
+            return
+        messagebox.showinfo("术语库同步成功", f"已同步 {len(terms)} 条项目术语。")
+        self.log(f"术语库同步成功：{config['glossary_project_slug']}，{len(terms)} 条。")
 
     def set_entry(self, entry: ttk.Entry, value: str) -> None:
         entry.delete(0, tk.END)
@@ -370,7 +422,7 @@ class MacHybridApp:
             messagebox.showerror("文件不支持", "以下文件不存在或不是 .docx：\n" + "\n".join(str(path) for path in invalid[:10]))
             return
         self.set_entry(self.output_dir_entry, str(output_dir))
-        core.save_config(provider, api_key if self.remember_key.get() else "", base_url, model, english_font, chinese_font)
+        core.save_config(provider, api_key if self.remember_key.get() else "", base_url, model, english_font, chinese_font, self.get_cloud_glossary_config())
 
         self.is_running = True
         self.job_results = []

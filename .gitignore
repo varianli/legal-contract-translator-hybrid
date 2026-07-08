@@ -5,6 +5,7 @@ __pycache__/
 **/__pycache__/
 *.py[cod]
 *.pyo
+*.zip
 
 # Local secrets and saved API keys
 .env
@@ -12,6 +13,8 @@ __pycache__/
 .translator_config.json
 新方案/.new_scheme_config.json
 复合方法/.hybrid_config.json
+.glossary_cache/
+**/.glossary_cache/
 
 # Generated translation outputs
 输出/
